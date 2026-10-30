@@ -1,0 +1,17 @@
+# Runtime dependencies
+fastapi
+uvicorn[standard]
+pydantic-settings
+python-dotenv
+
+# Data layer (Phase 2)
+pandas
+yfinance
+fyers-apiv3
+requests
+
+# Scheduler (Phase 3)
+apscheduler
+
+# Alerts (Phase 5) - direct HTTP calls to the Telegram Bot API
+httpx

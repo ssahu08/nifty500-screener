@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="description" content="Personal NSE Nifty 500 quantitative screener. Advisory only." />
+    <meta name="theme-color" content="#0f172a" />
+    <title>N500 Stock Screener</title>
+    <link rel="manifest" href="/manifest.json" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png" />
+    <link rel="apple-touch-icon" href="/icon-192.png" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="N500" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link rel="stylesheet" href="/styles.css?v=15" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="dot"></span>
+        <span class="brand-name">N500<span class="accent">/</span>SCREENER</span>
+        <span class="badge">advisory only</span>
+      </div>
+      <div class="status">
+        <span class="status-dot" id="status-dot"></span>
+        <span id="status-text">connecting…</span>
+        <button class="btn ghost sm" id="refresh-all" title="Reload everything">Refresh all</button>
+        <button class="btn ghost sm" id="admin-toggle" title="Admin console: API usage & storage">Admin</button>
+        <button class="btn ghost sm" id="overview-toggle" title="Market Overview">Market Overview</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <!-- Strategy Results stays as full-width panel -->
+      <section class="panel" aria-labelledby="results-title">
+        <div class="panel-head">
+          <div>
+            <h2 id="results-title">Strategy Results</h2>
+            <span class="muted" id="results-updated"></span>
+          </div>
+          <div class="filters" id="filters">
+            <button class="chip active" data-cat="all">All</button>
+            <button class="chip" data-cat="intraday">Intraday</button>
+            <button class="chip" data-cat="short-term">Short-term</button>
+            <button class="chip" data-cat="long-term">Long-term</button>
+            <button class="chip" data-cat="event-driven">Event-driven</button>
+          </div>
+        </div>
+        <div class="results-list" id="results">
+          <div class="placeholder">Loading strategies…</div>
+        </div>
+      </section>
+
+      <!-- Drop-down panels: positioned top-right below the topbar -->
+      <!-- Market Overview -->
+      <section class="panel dropdown-panel hidden" id="overview-panel" aria-labelledby="overview-title">
+        <div class="panel-head">
+          <div>
+            <h2 id="overview-title">Market Overview</h2>
+            <span class="muted" id="overview-updated">last 5 NSE trading days · with change %</span>
+          </div>
+          <div class="panel-tools">
+            <span class="muted" id="admin-updated"></span>
+            <button class="btn ghost sm" id="refresh-overview" title="Refetch live values">Refresh</button>
+          </div>
+        </div>
+        <div class="errors" id="overview-errors" hidden></div>
+        <div class="table-wrap" id="overview">
+          <div class="placeholder">Loading market overview…</div>
+        </div>
+      </section>
+
+      <!-- Admin console: read-only observability (API usage + storage) -->
+      <section class="panel dropdown-panel hidden" id="admin-panel" aria-labelledby="admin-title">
+        <div class="panel-head">
+          <div>
+            <h2 id="admin-title">Admin Console</h2>
+            <span class="muted" id="admin-updated"></span>
+          </div>
+          <div class="panel-tools">
+            <button class="btn ghost sm" id="refresh-admin" title="Refresh admin data">Refresh</button>
+          </div>
+        </div>
+        <div class="admin-grid">
+          <!-- API usage card (MyJio-style gauge) -->
+          <div class="admin-card usage-card">
+            <div class="admin-card-head">
+              <h3>API Usage</h3>
+              <span class="muted" id="admin-api-updated"></span>
+            </div>
+            <div class="gauge-wrap">
+              <svg class="gauge" viewBox="0 0 100 100">
+                <circle class="gauge-track" cx="50" cy="50" r="40" />
+                <circle class="gauge-progress" id="gauge-progress" cx="50" cy="50" r="40" />
+              </svg>
+              <div class="gauge-text">
+                <div class="gauge-value" id="api-used">--</div>
+                <div class="gauge-label">API calls used today</div>
+              </div>
+            </div>
+            <div class="admin-stats">
+              <div class="stat"><div class="stat-value" id="api-day-limit">--</div><div class="stat-label">daily limit</div></div>
+              <div class="stat"><div class="stat-value" id="api-remaining">--</div><div class="stat-label">remaining today</div></div>
+              <div class="stat"><div class="stat-value" id="api-pct">--%</div><div class="stat-label">of daily limit</div></div>
+              <div class="stat"><div class="stat-value" id="api-per-sec">--</div><div class="stat-label">calls/sec (now)</div></div>
+              <div class="stat"><div class="stat-value" id="api-per-min">--</div><div class="stat-label">calls/min (now)</div></div>
+            </div>
+          </div>
+
+          <!-- Database storage card -->
+          <div class="admin-card storage-card">
+            <div class="admin-card-head">
+              <h3>Database Storage</h3>
+              <span class="muted" id="admin-db-updated"></span>
+            </div>
+            <table class="grid admin-table">
+              <tbody>
+                <tr><td>Database file</td><td id="db-path" class="mono">--</td></tr>
+                <tr><td>File size</td><td id="db-size">--</td></tr>
+                <tr><td>Total signals stored</td><td id="db-signals">--</td></tr>
+                <tr><td>Strategies tracked</td><td id="db-strategies">--</td></tr>
+                <tr><td>Retention window</td><td id="db-retention">-- days</td></tr>
+                <tr><td>Oldest run</td><td id="db-oldest" class="mono">--</td></tr>
+                <tr><td>Latest run</td><td id="db-latest" class="mono">--</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>Phase 7 · dashboard</span>
+      <span class="muted" id="meta"></span>
+    </footer>
+
+    <div class="toasts" id="toasts" aria-live="polite"></div>
+
+    <!-- PIN gate: overlay shown when DASHBOARD_PIN protects the API -->
+    <div class="pin-gate hidden" id="pin-gate" role="dialog" aria-modal="true" aria-labelledby="pin-title">
+      <div class="pin-card">
+        <div class="pin-brand">N500<span class="accent">/</span>SCREENER</div>
+        <h2 id="pin-title">Enter PIN</h2>
+        <p class="muted">This dashboard is protected</p>
+        <input id="pin-input" class="pin-input" type="password" inputmode="numeric"
+               autocomplete="current-password" maxlength="12" placeholder="••••" />
+        <div class="pin-error" id="pin-error" role="alert"></div>
+        <button class="btn pin-submit" id="pin-submit">Unlock</button>
+      </div>
+    </div>
+
+    <script src="/app.js?v=25"></script>
+  </body>
+</html>

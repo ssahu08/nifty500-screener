@@ -1,0 +1,53 @@
+# Render deployment for the N500 Stock Screener (free tier).
+#
+# One web process runs everything: FastAPI + the in-process APScheduler
+# (strategies start inside the app lifespan). Keep the instance awake during
+# market hours with an external pinger (cron-job.org) hitting /health every
+# 5-10 minutes between 09:00 and 15:45 IST - a sleeping service stops the
+# scheduler and misses the 15:20 EOD compression run.
+#
+# Secrets below use `sync: false`: set them once in the Render dashboard
+# (Environment tab). Never commit real values - .env is gitignored.
+services:
+  - type: web
+    name: n500-screener
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: ENV
+        value: production
+      # uvicorn's --host/--port win here, but python -m app.main honours these.
+      - key: HOST
+        value: 0.0.0.0
+      - key: DATABASE_PATH
+        value: data/screener.db
+      - key: RETENTION_DAYS
+        value: "14"
+      # --- Secrets (set in the Render dashboard, not in this file) ---------
+      # Numeric PIN protecting the dashboard API on the public URL.
+      - key: DASHBOARD_PIN
+        sync: false
+      # FYERS API credentials (names match app/config.py, not FYERS_APP_ID).
+      - key: FYERS_CLIENT_ID
+        sync: false
+      - key: FYERS_SECRET_KEY
+        sync: false
+      - key: FYERS_FY_ID
+        sync: false
+      - key: FYERS_PIN
+        sync: false
+      - key: FYERS_TOTP_SECRET
+        sync: false
+      # Optional 15-day bootstrap refresh token (used when data/ is wiped on
+      # a redeploy; rotated tokens are persisted to data/fyers_tokens.json).
+      - key: FYERS_REFRESH_TOKEN
+        sync: false
+      # Telegram alerts
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false

@@ -1,0 +1,16 @@
+.env
+.venv/
+data/*.db
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+dist/
+build/
+/tmp/
+.opencode/
+*.log
