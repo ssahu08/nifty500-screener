@@ -1,0 +1,8 @@
+source .venv/bin/activate — activate
+python --version / python -c "import app" — check env
+curl .../health — health
+nohup .venv/bin/uvicorn ... / pkill -f "uvicorn" — start/restart/stop
+.venv/bin/python - <<'PY' — manual OEL engine invocation
+sqlite3 ... — DB results
+cat /tmp/opencode/oel_ranked_run.json | ... — background scan output
+echo "=== STATUS ===" — quick combined check (branch, commit, .env, server health, DB count)
