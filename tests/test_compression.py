@@ -1,7 +1,8 @@
-"""Tests for the EOD Compression Breakout strategy (Strategy 5, v3)."""
+"""Tests for the unified EOD compression / Guppy / RSI(9) strategy (Strategy 5)."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -11,33 +12,40 @@ import pandas as pd
 from app.config import Settings
 from app.core.market import next_trading_day
 from app.data.provider import Quote
+from app.strategies import compression as compression_module
 from app.strategies.compression import (
     BAND_BUY_MIN,
-    BAND_HOLD_MIN,
+    BOLLINGER_NUM_STD,
+    BOLLINGER_PERIOD,
     BOX_BARS,
-    C_MAX_POINTS,
-    MTF_CONFLUENCE_BONUS,
-    SQUEEZE_MAX_RATIO,
+    GMMA_FAST_PERIODS,
+    GMMA_SLOW_PERIODS,
+    MAX_SIGNALS,
+    MIN_BARS,
     EodCompressionBreakoutStrategy,
+    _box_ignition,
+    _Candidate,
+    _closing_frame,
     _daily_context,
-    hourly_from_10m,
+    _flat_coil,
+    _midline_reclaim,
+    _score,
+    _short_breakdown,
+    _snapshot,
+    _staircase,
 )
 from app.strategies.indicators import closed_candles
 
 IST = ZoneInfo("Asia/Kolkata")
 #: Continuous NSE 10-minute bars per session (09:15..15:05 labels, ending 15:15).
 BARS_PER_SESSION = 36
+#: Fixed replay date for the synthetic fixtures.
+SCAN_DATE = date(2025, 1, 8)
+SCAN_NOW = datetime(2025, 1, 8, 15, 35, tzinfo=IST)
 
 
 def _settings() -> Settings:
     return Settings(_env_file=None, database_path="data/test.db")
-
-
-def _next_day(t: datetime) -> datetime:
-    t = (t + timedelta(days=1)).replace(hour=9, minute=15)
-    while t.weekday() > 4:
-        t += timedelta(days=1)
-    return t
 
 
 def _to_df(rows: list[tuple]) -> pd.DataFrame:
@@ -54,119 +62,94 @@ def _to_df(rows: list[tuple]) -> pd.DataFrame:
     )
 
 
-def compression_10m(seed: int = 1, wide: bool = False) -> pd.DataFrame:
-    """Deterministic 10-minute series: volatile phase, compression, ramp, doji.
+def _next_bar(t: datetime) -> datetime:
+    """Next 10-minute label, rolling over to the next NSE session."""
+    t += timedelta(minutes=10)
+    if t.hour > 15 or (t.hour == 15 and t.minute > 5):
+        t = (t + timedelta(days=1)).replace(hour=9, minute=15)
+        while t.weekday() > 4:
+            t += timedelta(days=1)
+    return t
 
-    ``wide`` inflates all ranges so the box/squeeze gates can never pass.
+
+def flat_coil_10m(seed: int = 7) -> pd.DataFrame:
+    """Two volatile sessions, then one tight rising session ending in a coil.
+
+    The volatile phase inflates the rolling Bollinger-bandwidth median, while
+    the last 15 bars form a sub-0.3% box above the 21-period mid-line.
     """
     rng = np.random.default_rng(seed)
     rows: list[tuple] = []
     t = datetime(2025, 1, 6, 9, 15, tzinfo=IST)
-    price = 100.0
+    anchor = 100.0
+    price = anchor
 
-    # Six volatile sessions (inflate the historical bandwidth).
-    for s in range(6):
-        for _ in range(BARS_PER_SESSION):
-            drift = 0.002 if s % 2 == 0 else -0.001
-            move = rng.normal(drift, 0.02 if wide else 0.006)
-            o = price
-            c = max(1.0, price * (1 + move))
-            h = max(o, c) * (1 + abs(rng.normal(0, 0.002)))
-            low = min(o, c) * (1 - abs(rng.normal(0, 0.002)))
-            rows.append((t, o, h, low, c, 1000))
-            price = c
-            t += timedelta(minutes=10)
-        t = _next_day(t)
-
-    # Three full sessions of mean-reverting compression around an anchor.
-    anchor = price
-    for _ in range(3):
-        for _ in range(BARS_PER_SESSION):
-            o = price
-            c = anchor * (1 + rng.normal(0, 0.01 if wide else 0.0003))
-            h = max(o, c) * (1 + abs(rng.normal(0, 0.0004)))
-            low = min(o, c) * (1 - abs(rng.normal(0, 0.0004)))
-            rows.append((t, o, h, low, c, 300))
-            price = c
-            t += timedelta(minutes=10)
-        t = _next_day(t)
-
-    # Final session: flat, then a gentle ramp, then the closing near-doji.
-    # In ``wide`` mode even the closing stretch is volatile: nothing is coiled.
-    for _ in range(BARS_PER_SESSION - 11):
+    # Two volatile sessions around the anchor -> high rolling median bandwidth.
+    for _ in range(2 * BARS_PER_SESSION):
         o = price
-        c = anchor * (1 + rng.normal(0, 0.01 if wide else 0.0003))
-        h = max(o, c) * (1 + abs(rng.normal(0, 0.0004)))
-        low = min(o, c) * (1 - abs(rng.normal(0, 0.0004)))
-        rows.append((t, o, h, low, c, 300))
+        c = anchor * (1.0 + rng.normal(0.0, 0.006))
+        h = max(o, c) * (1.0 + abs(rng.normal(0.0, 0.002)))
+        low = min(o, c) * (1.0 - abs(rng.normal(0.0, 0.002)))
+        rows.append((t, o, h, low, c, 1000.0))
         price = c
-        t += timedelta(minutes=10)
-    for _ in range(10):
+        t = _next_bar(t)
+
+    # One tight, gently rising session; the last 15 bars are the coil box.
+    price = anchor
+    for i in range(BARS_PER_SESSION):
+        target = anchor * (1.000 + 0.00012 * i)
         o = price
-        c = price * (1 + (0.002 if wide else 0.0003))
-        rows.append((t, o, c * (1 + 0.0005), o * (1 - 0.0004), c, 300))
+        c = target + rng.normal(0.0, 0.00015)
+        h = max(o, c) * (1.0 + 0.0002)
+        low = min(o, c) * (1.0 - 0.0002)
+        if i == BARS_PER_SESSION - 1:
+            o = target * 0.9998
+            c = target
+            h = target * 1.0001
+            low = target * 0.9996
+        rows.append((t, o, h, low, c, 500.0))
         price = c
-        t += timedelta(minutes=10)
-    o = price
-    c = price * (1 + 0.00001)
-    rows.append((t, o, price * (1 + 0.0004), price * (1 - 0.0004), c, 300))
+        t = _next_bar(t)
 
     return _to_df(rows)
 
 
-def compression_1h(seed: int = 2) -> pd.DataFrame:
-    """Deterministic hourly series: volatility, tight coil, gentle drift up."""
+def short_breakdown_10m() -> pd.DataFrame:
+    """The flat-coil series plus a high-volume 15:25 closing-auction break."""
+    frame = flat_coil_10m()
+    timestamp = pd.Timestamp(datetime(2025, 1, 8, 15, 25, tzinfo=IST))
+    frame.loc[timestamp, ["open", "high", "low", "close", "volume"]] = [
+        100.42,
+        100.45,
+        98.95,
+        99.00,
+        6000.0,
+    ]
+    return frame.sort_index()
+
+
+def volatile_10m(seed: int = 5) -> pd.DataFrame:
+    """A wide, trendless series with no afternoon compression box."""
     rng = np.random.default_rng(seed)
     rows: list[tuple] = []
     t = datetime(2025, 1, 6, 9, 15, tzinfo=IST)
     price = 100.0
-
-    def roll(t: datetime) -> datetime:
-        t += timedelta(hours=1)
-        while t.hour >= 16 or t.hour < 9:
-            t = (t + timedelta(days=1)).replace(hour=9, minute=15)
-            while t.weekday() > 4:
-                t += timedelta(days=1)
-        return t
-
-    for _ in range(40):
+    for _ in range(3 * BARS_PER_SESSION):
         o = price
-        c = price * (1 + rng.normal(0.001, 0.009))
-        h = max(o, c) * (1 + abs(rng.normal(0, 0.004)))
-        low = min(o, c) * (1 - abs(rng.normal(0, 0.004)))
-        rows.append((t, o, h, low, c, 1000))
+        c = max(1.0, price * (1.0 + rng.normal(0.0, 0.02)))
+        h = max(o, c) * (1.0 + abs(rng.normal(0.0, 0.005)))
+        low = min(o, c) * (1.0 - abs(rng.normal(0.0, 0.005)))
+        rows.append((t, o, h, low, c, 1000.0))
         price = c
-        t = roll(t)
-
-    anchor = price
-    for _ in range(30):
-        o = price
-        c = anchor * (1 + rng.normal(0, 0.0003))
-        h = max(o, c) * (1 + abs(rng.normal(0, 0.0004)))
-        low = min(o, c) * (1 - abs(rng.normal(0, 0.0004)))
-        rows.append((t, o, h, low, c, 300))
-        price = c
-        t = roll(t)
-
-    for _ in range(15):
-        o = price
-        c = price * 1.0002
-        rows.append((t, o, c * 1.0003, o * 0.9998, c, 300))
-        price = c
-        t = roll(t)
-
-    o = price
-    c = price * 1.00001
-    rows.append((t, o, price * 1.0004, price * 0.9996, c, 300))
-
+        t = _next_bar(t)
     return _to_df(rows)
 
 
 def daily_uptrend(days: int = 260, tight_base: int = 6) -> pd.DataFrame:
     """Steady daily uptrend finishing in a tight base near the 52-week high."""
-    idx = pd.bdate_range("2025-01-06", periods=days)
+    idx = pd.bdate_range(end="2025-01-07", periods=days)
     rng = np.random.default_rng(11)
-    closes = np.linspace(80.0, 128.0, days) + rng.normal(0.0, 0.5, days)
+    closes = np.linspace(80.0, 100.5, days) + rng.normal(0.0, 0.4, days)
     highs = closes * 1.011
     lows = closes * 0.989
     for i in range(days - tight_base, days):
@@ -181,197 +164,293 @@ def daily_uptrend(days: int = 260, tight_base: int = 6) -> pd.DataFrame:
     )
 
 
-# -- scan -------------------------------------------------------------------
-def test_scan_emits_scored_signal_with_metadata() -> None:
+def _flat_snapshot():
+    base = closed_candles(flat_coil_10m(), "10m", SCAN_NOW)
+    snapshot = _snapshot(base)
+    assert snapshot is not None
+    return snapshot
+
+
+# -- end-to-end scan --------------------------------------------------------
+def test_scan_emits_buy_only_flat_coil() -> None:
     strategy = EodCompressionBreakoutStrategy()
-    df = compression_10m(seed=1)
-    signals = strategy.scan(
-        {"NSE:TEST-EQ": {"10m": df, "daily": daily_uptrend()}},
+    signals = strategy._scan(
+        {"NSE:TEST-EQ": {"10m": flat_coil_10m(), "daily": daily_uptrend()}},
         _settings(),
+        SCAN_NOW,
     )
-    assert signals, "expected at least one signal on compressed data"
-    # v3 dedup: one signal per symbol (best of 10m / derived 1h).
+
     assert len(signals) == 1
     signal = signals[0]
-
     assert signal.symbol == "NSE:TEST-EQ"
     assert signal.strategy_name == "EOD Compression Breakout"
-    assert signal.price == float(df["close"].iloc[-1])
+    assert signal.price == float(flat_coil_10m()["close"].iloc[-1])
 
     meta = signal.metadata
-    assert meta["timeframe"] in {"10m", "1h"}
-    assert meta["setup_type"] in {"EOD_COIL", "BOX_IGNITION", "SPRING_RECLAIM"}
-    assert meta["compression_bars"] == BOX_BARS[meta["timeframe"]]
-    assert meta["expected_move_date"] == next_trading_day(datetime.now(IST).date()).isoformat()
-    assert 0.0 <= meta["score"] <= 100.0
-    assert meta["band"] in {"BUY", "HOLD", "SKIP"}
+    assert meta["band"] == "BUY"
+    assert meta["score"] >= BAND_BUY_MIN
+    assert meta["direction"] == "LONG"
+    assert meta["setup_type"] == "FLAT_COIL"
+    assert meta["timeframe"] == "10m"
+    assert meta["compression_bars"] == BOX_BARS
+    assert meta["trigger_bar"] == "15:05"
+    assert meta["dual_bar"] is False
+    assert meta["daily_data"] is True
+
+
+def test_signal_timestamp_is_candle_not_scan_time() -> None:
+    strategy = EodCompressionBreakoutStrategy()
+    signal = strategy._scan(
+        {"NSE:TEST-EQ": {"10m": flat_coil_10m(), "daily": daily_uptrend()}},
+        _settings(),
+        SCAN_NOW,
+    )[0]
+
+    candle_time = datetime(2025, 1, 8, 15, 5, tzinfo=IST)
+    assert signal.timestamp == candle_time
+    assert signal.timestamp != SCAN_NOW
+    assert signal.metadata["candle_time"] == candle_time.isoformat()
+    assert signal.metadata["expected_move_date"] == next_trading_day(SCAN_DATE).isoformat()
+
+
+def test_score_components_add_up_and_band_is_buy() -> None:
+    strategy = EodCompressionBreakoutStrategy()
+    signal = strategy._scan(
+        {"NSE:TEST-EQ": {"10m": flat_coil_10m(), "daily": daily_uptrend()}},
+        _settings(),
+        SCAN_NOW,
+    )[0]
+    meta = signal.metadata
+
+    parts = (
+        meta["score_compression"]
+        + meta["score_trigger"]
+        + meta["score_participation"]
+        + meta["score_daily"]
+        + meta["score_bonus"]
+    )
+    assert abs(parts - meta["score"]) < 0.2
+    assert 0.0 <= meta["score_compression"] <= 32.0
+    assert 0.0 <= meta["score_trigger"] <= 43.0
+    assert 0.0 <= meta["score_participation"] <= 12.0
+    assert 0.0 <= meta["score_daily"] <= 18.0
+    assert meta["score_bonus"] == 0.0
+    assert meta["band"] == "BUY"
+    assert meta["score"] >= BAND_BUY_MIN
+
+
+def test_long_execution_levels() -> None:
+    strategy = EodCompressionBreakoutStrategy()
+    signal = strategy._scan(
+        {"NSE:TEST-EQ": {"10m": flat_coil_10m(), "daily": daily_uptrend()}},
+        _settings(),
+        SCAN_NOW,
+    )[0]
+    meta = signal.metadata
+
     assert meta["entry"] > signal.price > meta["stop"]
     assert meta["target_1"] > meta["entry"] > meta["stop"]
     assert meta["target_2"] > meta["target_1"]
-    assert meta["box_range_pct"] <= 3.0
-    assert meta["squeeze_ratio"] <= SQUEEZE_MAX_RATIO
-    assert meta["daily_data"] is True
-    assert meta["mtf_confluence"] is True  # both timeframes fired on this series
-    for key in ("rsi9", "par20", "wick_ratio", "base_days", "turnover_cr", "dist_52w_pct",
-                "vol_mult", "score_bonus"):
-        assert key in meta
+    assert meta["limit_price"] > meta["entry"]
+    assert meta["risk_pct"] >= 1.2
 
 
-def test_score_components_add_up_and_bands_match() -> None:
+def test_short_breakdown_emits_short_at_15_25() -> None:
     strategy = EodCompressionBreakoutStrategy()
-    signals = strategy.scan(
-        {"NSE:TEST-EQ": {"10m": compression_10m(seed=3), "daily": daily_uptrend()}},
+    signals = strategy._scan(
+        {"NSE:SHORT-EQ": {"10m": short_breakdown_10m(), "daily": daily_uptrend()}},
         _settings(),
+        SCAN_NOW,
     )
-    assert signals
-    for signal in signals:
-        meta = signal.metadata
-        parts = [
-            meta["score_compression"],
-            meta["score_absorption"],
-            meta["score_timing"],
-            meta["score_daily"],
-            meta.get("score_bonus", 0.0),
-        ]
-        assert 0.0 <= parts[0] <= 24.0
-        assert 0.0 <= parts[1] <= 26.0
-        assert 0.0 <= parts[2] <= C_MAX_POINTS
-        assert 0.0 <= parts[3] <= 24.0
-        assert 0.0 <= parts[4] <= MTF_CONFLUENCE_BONUS
-        assert abs(sum(parts) - meta["score"]) < 0.3
-        expected = (
-            "BUY" if meta["score"] >= BAND_BUY_MIN
-            else "HOLD" if meta["score"] >= BAND_HOLD_MIN
-            else "SKIP"
-        )
-        assert meta["band"] == expected
+
+    assert len(signals) == 1
+    signal = signals[0]
+    meta = signal.metadata
+    assert meta["band"] == "BUY"
+    assert meta["score"] >= BAND_BUY_MIN
+    assert meta["direction"] == "SHORT"
+    assert meta["setup_type"] == "SHORT_BREAKDOWN"
+    assert meta["trigger_bar"] == "15:25"
+    assert meta["dual_bar"] is True
+    assert signal.timestamp == datetime(2025, 1, 8, 15, 25, tzinfo=IST)
+    assert signal.timestamp != SCAN_NOW
+
+    assert meta["stop"] > meta["entry"]
+    assert meta["target_1"] < meta["entry"]
+    assert meta["target_2"] < meta["target_1"]
+    assert meta["limit_price"] < meta["entry"]
+    assert meta["risk_pct"] >= 1.2
 
 
-def test_signals_sorted_by_score_desc() -> None:
+def test_dual_bar_breakdown_invalidates_earlier_long_coil() -> None:
+    """Before 15:35 the 15:25 auction bar is invisible; the coil stands."""
     strategy = EodCompressionBreakoutStrategy()
+    data = {"NSE:SHORT-EQ": {"10m": short_breakdown_10m(), "daily": daily_uptrend()}}
+
+    early = strategy._scan(data, _settings(), datetime(2025, 1, 8, 15, 30, tzinfo=IST))
+    assert len(early) == 1
+    assert early[0].metadata["direction"] == "LONG"
+    assert early[0].metadata["setup_type"] == "FLAT_COIL"
+    assert early[0].timestamp == datetime(2025, 1, 8, 15, 5, tzinfo=IST)
+    assert early[0].metadata["dual_bar"] is False
+
+    confirmed = strategy._scan(data, _settings(), SCAN_NOW)
+    assert len(confirmed) == 1
+    assert confirmed[0].metadata["direction"] == "SHORT"
+    assert confirmed[0].metadata["setup_type"] == "SHORT_BREAKDOWN"
+    assert confirmed[0].timestamp == datetime(2025, 1, 8, 15, 25, tzinfo=IST)
+
+
+def test_closing_frame_waits_for_auction_bar_to_close() -> None:
+    raw = short_breakdown_10m()
+    base = closed_candles(raw, "10m", SCAN_NOW)
+
+    assert _closing_frame(raw, base, datetime(2025, 1, 8, 15, 30, tzinfo=IST)) is None
+    assert _closing_frame(raw, base, datetime(2025, 1, 8, 15, 34, tzinfo=IST)) is None
+
+    closing = _closing_frame(raw, base, SCAN_NOW)
+    assert closing is not None
+    assert closing.index[-1] == pd.Timestamp(datetime(2025, 1, 8, 15, 25, tzinfo=IST))
+    assert len(closing) == len(base) + 1
+
+
+def test_top_15_cap_and_score_sort() -> None:
+    strategy = EodCompressionBreakoutStrategy()
+    frame = flat_coil_10m()
     daily = daily_uptrend()
-    signals = strategy.scan(
-        {
-            "NSE:A-EQ": {"10m": compression_10m(seed=1), "daily": daily},
-            "NSE:B-EQ": {"10m": compression_10m(seed=2), "daily": daily},
-        },
-        _settings(),
-    )
-    assert len(signals) >= 2
-    scores = [s.metadata["score"] for s in signals]
+    data = {
+        f"NSE:S{i:02d}-EQ": {"10m": frame, "daily": daily}
+        for i in range(MAX_SIGNALS + 5)
+    }
+    signals = strategy._scan(data, _settings(), SCAN_NOW)
+
+    assert len(signals) == MAX_SIGNALS
+    scores = [signal.metadata["score"] for signal in signals]
     assert scores == sorted(scores, reverse=True)
+    assert all(signal.metadata["band"] == "BUY" for signal in signals)
 
 
-def test_scan_is_robust_across_seeds() -> None:
+def test_volatile_data_emits_nothing() -> None:
     strategy = EodCompressionBreakoutStrategy()
-    for seed in (1, 2, 3, 4, 5):
-        signals = strategy.scan(
-            {"NSE:TEST-EQ": {"10m": compression_10m(seed=seed, wide=False)}},
-            _settings(),
-        )
-        assert len(signals) == 1, f"seed {seed}"  # dedup: one signal per symbol
-
-
-def test_no_signal_when_range_is_wide() -> None:
-    strategy = EodCompressionBreakoutStrategy()
-    signals = strategy.scan({"NSE:TEST-EQ": {"10m": compression_10m(wide=True)}}, _settings())
+    signals = strategy._scan(
+        {"NSE:VOL-EQ": {"10m": volatile_10m(), "daily": daily_uptrend()}},
+        _settings(),
+        SCAN_NOW,
+    )
     assert signals == []
+
+
+def test_short_history_emits_nothing() -> None:
+    strategy = EodCompressionBreakoutStrategy()
+    short_frame = flat_coil_10m().tail(MIN_BARS - 1)
+    assert strategy._scan(
+        {"NSE:X-EQ": {"10m": short_frame, "daily": daily_uptrend()}},
+        _settings(),
+        SCAN_NOW,
+    ) == []
+
+
+def test_weak_setup_below_buy_cutoff() -> None:
+    """A marginal box scores below the BUY floor and must never be emitted."""
+    snapshot = _flat_snapshot()
+    weak = replace(
+        snapshot,
+        box_range_pct=0.009,
+        squeeze=0.49,
+        nozzle=0.34,
+        thin_density=0.0,
+    )
+    candidate = _Candidate(
+        setup_type="FLAT_COIL",
+        direction="LONG",
+        snapshot=weak,
+        trigger_bar="15:05",
+        box_high=weak.box_high,
+        box_low=weak.box_low,
+        box_range_pct=weak.box_range_pct,
+        box_position=weak.box_position,
+        squeeze=weak.squeeze,
+        nozzle=weak.nozzle,
+        thin_density=weak.thin_density,
+    )
+    score, _ = _score(candidate, None)
+    assert score < BAND_BUY_MIN
+
+
+def test_no_absolute_squeeze_free_pass() -> None:
+    """The old absolute-bandwidth loophole and hourly path are gone."""
+    assert not hasattr(compression_module, "ABS_SQUEEZE_MAX_BW")
+    assert not hasattr(compression_module, "hourly_from_10m")
+    assert BOLLINGER_PERIOD == 21
+    assert BOLLINGER_NUM_STD == 2.0
+    assert GMMA_FAST_PERIODS == (3, 5, 8, 10, 12, 15)
+    assert GMMA_SLOW_PERIODS == (30, 35, 40, 45, 50, 60)
+
+
+# -- archetype gates --------------------------------------------------------
+def test_flat_coil_rejects_loose_or_impulsive_setups() -> None:
+    snapshot = _flat_snapshot()
+    assert _flat_coil(snapshot)
+    assert not _flat_coil(replace(snapshot, squeeze=0.51))
+    assert not _flat_coil(replace(snapshot, day_impulse=0.02))
+
+
+def test_staircase_requires_impulse_and_rejects_1525_continuation() -> None:
+    snapshot = _flat_snapshot()
+    impulsive = replace(snapshot, day_impulse=0.02)
+    assert _staircase(impulsive, None)
+    # A 15:25 snapshot may only confirm a reclaim when 15:05 was below the mid.
+    assert not _staircase(impulsive, snapshot)
+
+
+def test_midline_reclaim_requires_prior_close_below_mid() -> None:
+    snapshot = _flat_snapshot()
+    below = replace(snapshot, last=snapshot.mid * 0.99)
+    assert _midline_reclaim(snapshot, below)
+    assert not _midline_reclaim(below, below)
+
+
+def test_box_ignition_requires_volume_expansion() -> None:
+    snapshot = _flat_snapshot()
+    ignition = replace(snapshot, up_break=0.005, vol_ratio=2.0)
+    assert _box_ignition(ignition)
+    assert not _box_ignition(replace(ignition, vol_ratio=1.0))
+
+
+def test_short_breakdown_rejects_weak_volume_and_no_break() -> None:
+    raw = short_breakdown_10m()
+    base = closed_candles(raw, "10m", SCAN_NOW)
+    m05 = _snapshot(base)
+    m25 = _snapshot(_closing_frame(raw, base, SCAN_NOW))
+    assert m05 is not None and m25 is not None
+
+    assert _short_breakdown(m25, m05)
+    assert not _short_breakdown(replace(m25, vol_ratio=1.0), m05)
+    assert not _short_breakdown(replace(m25, dn_break=0.0), m05)
+
+
+# -- daily context ----------------------------------------------------------
+def test_daily_context_drops_today_and_requires_enough_bars() -> None:
+    daily = daily_uptrend()
+    ctx = _daily_context(daily, SCAN_DATE)
+    assert ctx is not None
+    assert len(ctx) == 260
+    assert all(day < SCAN_DATE for day in ctx.index.date)
+
+    assert _daily_context(None, SCAN_DATE) is None
+    assert _daily_context(daily.tail(30), SCAN_DATE) is None
 
 
 def test_scan_handles_empty_and_missing_frames() -> None:
     strategy = EodCompressionBreakoutStrategy()
-    assert strategy.scan({}, _settings()) == []
-    assert strategy.scan({"NSE:X-EQ": {}}, _settings()) == []
-    assert strategy.scan({"NSE:X-EQ": {"10m": pd.DataFrame()}}, _settings()) == []
+    assert strategy._scan({}, _settings(), SCAN_NOW) == []
+    assert strategy._scan({"NSE:X-EQ": {}}, _settings(), SCAN_NOW) == []
+    assert strategy._scan(
+        {"NSE:X-EQ": {"10m": pd.DataFrame()}}, _settings(), SCAN_NOW
+    ) == []
 
 
-def test_mtf_dedup_emits_single_signal_with_tracked_bonus() -> None:
-    """Both 10m and derived 1h fire -> one signal, +5 tracked as score_bonus."""
-    strategy = EodCompressionBreakoutStrategy()
-    signals = strategy.scan(
-        {"NSE:TEST-EQ": {"10m": compression_10m(seed=1), "daily": daily_uptrend()}},
-        _settings(),
-    )
-    assert len(signals) == 1
-    meta = signals[0].metadata
-    assert meta["mtf_confluence"] is True
-    assert meta["score_bonus"] == MTF_CONFLUENCE_BONUS
-    # The bonus is attributed, so components still add up to the total.
-    parts = sum(
-        meta[k]
-        for k in (
-            "score_compression",
-            "score_absorption",
-            "score_timing",
-            "score_daily",
-        )
-    )
-    assert abs(parts + meta["score_bonus"] - meta["score"]) < 0.3
-    expected = (
-        "BUY" if meta["score"] >= BAND_BUY_MIN
-        else "HOLD" if meta["score"] >= BAND_HOLD_MIN
-        else "SKIP"
-    )
-    assert meta["band"] == expected
-
-
-def test_single_timeframe_has_no_bonus(monkeypatch) -> None:
-    """When the hourly path is unavailable there is no dedup and no bonus."""
-    import app.strategies.compression as compression_module
-
-    monkeypatch.setattr(compression_module, "hourly_from_10m", lambda df: None)
-    strategy = EodCompressionBreakoutStrategy()
-    signals = strategy.scan({"NSE:TEST-EQ": {"10m": compression_10m(seed=1)}}, _settings())
-    assert len(signals) == 1
-    meta = signals[0].metadata
-    assert meta["mtf_confluence"] is False
-    assert meta["score_bonus"] == 0.0
-
-
-# -- daily context ----------------------------------------------------------
-def test_daily_context_boosts_score() -> None:
-    strategy = EodCompressionBreakoutStrategy()
-    df = compression_10m(seed=3)
-    with_daily = strategy.scan({"NSE:A-EQ": {"10m": df, "daily": daily_uptrend()}}, _settings())
-    without = strategy.scan({"NSE:A-EQ": {"10m": df}}, _settings())
-    ten_with = with_daily[0]
-    ten_without = without[0]
-
-    assert ten_with.metadata["daily_data"] is True
-    assert ten_without.metadata["daily_data"] is False
-    assert ten_without.metadata["score_daily"] == 0.0
-    assert ten_with.metadata["score_daily"] > 12.0
-    assert ten_with.metadata["score"] > ten_without.metadata["score"]
-
-
-def test_daily_context_drops_today_partial_bar() -> None:
-    today = date.today()
-    business = pd.bdate_range(end=pd.Timestamp(today) - pd.Timedelta(days=1), periods=70)
-    idx = business.append(pd.DatetimeIndex([pd.Timestamp(today)]))
-    closes = np.linspace(90.0, 100.0, len(idx))
-    frame = _to_df([(idx[i], closes[i], closes[i] * 1.01, closes[i] * 0.99, closes[i], 1e6)
-                    for i in range(len(idx))])
-
-    ctx = _daily_context(frame, today)
-    assert ctx is not None
-    assert len(ctx) == 70
-    assert all(d < today for d in ctx.index.date)
-    assert _daily_context(None, today) is None
-    assert _daily_context(frame.iloc[:30], today) is None
-
-
-# -- evaluation and helpers -------------------------------------------------
-def test_evaluate_1h_timeframe_fires() -> None:
-    strategy = EodCompressionBreakoutStrategy()
-    hourly = compression_1h(seed=2)
-    signal = strategy._evaluate(
-        "NSE:X-EQ", "1h", hourly, None, datetime.now(IST), "2026-01-02"
-    )
-    assert signal is not None
-    assert signal.metadata["timeframe"] == "1h"
-    assert signal.metadata["compression_bars"] == 3
-
-
+# -- shared candle helper ---------------------------------------------------
 def test_closed_candles_excludes_auction_bars() -> None:
     now = datetime(2026, 1, 2, 15, 20, tzinfo=IST)
     starts = [
@@ -391,21 +470,6 @@ def test_closed_candles_excludes_auction_bars() -> None:
     trimmed = closed_candles(df, "10m", now)
     assert len(trimmed) == 1
     assert trimmed.index[0] == starts[0]
-
-
-def test_hourly_from_10m_uses_full_nse_hours_only() -> None:
-    df = compression_10m(seed=1)
-    hourly = hourly_from_10m(df)
-    assert hourly is not None and not hourly.empty
-    counts = df.resample("1h", offset="15min")["close"].count()
-    assert (counts.reindex(hourly.index) == 6).all()
-    # Bins are NSE-aligned (09:15, 10:15, ...) and never include the close stub.
-    assert set(hourly.index.minute) == {15}
-    assert hourly.index.max().time() == datetime(2026, 1, 1, 14, 15).time()
-
-
-def test_hourly_from_10m_returns_none_for_empty() -> None:
-    assert hourly_from_10m(pd.DataFrame()) is None
 
 
 # -- prefilter --------------------------------------------------------------

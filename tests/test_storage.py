@@ -127,3 +127,72 @@ def test_save_run_refreshes_price_and_metadata_on_repeat(tmp_path) -> None:
     assert latest[0]["price"] == 105.0
     assert latest[0]["metadata"]["score"] == 82.5
     assert latest[0]["metadata"]["quality"] == "HIGH"
+
+
+def test_long_and_short_on_same_candle_are_distinct(tmp_path) -> None:
+    """A bidirectional strategy may emit both directions for one candle."""
+    store = SignalStore(_settings(tmp_path))
+    candle_time = datetime.now(IST)
+
+    long_signal = _signal("SBIN")
+    long_signal.timestamp = candle_time
+    long_signal.metadata = {"direction": "LONG", "band": "BUY"}
+    short_signal = _signal("SBIN")
+    short_signal.timestamp = candle_time
+    short_signal.metadata = {"direction": "SHORT", "band": "BUY"}
+
+    assert len(store.save_run("TestStrategy", [long_signal, short_signal])) == 2
+    latest = store.get_latest("TestStrategy")
+    assert {row["direction"] for row in latest} == {"LONG", "SHORT"}
+
+    # Re-saving both is a no-op; the unique key includes direction.
+    assert store.save_run("TestStrategy", [long_signal, short_signal]) == []
+
+
+def test_migration_backfills_direction_from_metadata(tmp_path) -> None:
+    """An older database without a direction column is upgraded in place."""
+    import json
+    import sqlite3
+
+    db_path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            strategy_name TEXT NOT NULL,
+            run_at TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            signal_time TEXT NOT NULL,
+            price REAL NOT NULL,
+            metadata TEXT DEFAULT '{}'
+        );
+        """
+    )
+    candle_time = datetime.now(IST).isoformat()
+    conn.execute(
+        "INSERT INTO runs "
+        "(strategy_name, run_at, symbol, signal_time, price, metadata) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            "TestStrategy",
+            candle_time,
+            "SBIN",
+            candle_time,
+            100.0,
+            json.dumps({"direction": "LONG"}),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    store = SignalStore(Settings(_env_file=None, database_path=str(db_path)))
+    rows = store.get_latest("TestStrategy")
+    assert len(rows) == 1
+    assert rows[0]["direction"] == "LONG"
+
+    # The migrated row participates in the new direction-aware dedup key.
+    repeat = _signal("SBIN")
+    repeat.timestamp = datetime.fromisoformat(candle_time)
+    repeat.metadata = {"direction": "LONG"}
+    assert store.save_run("TestStrategy", [repeat]) == []

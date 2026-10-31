@@ -200,8 +200,15 @@ def test_registry_contains_new_and_existing_strategies() -> None:
 
     registry = get_registry()
     assert "Guppy Ribbon Compression" in registry
-    assert "EOD Compression Breakout" in registry  # existing strategy untouched
+    assert "EOD Compression Breakout" in registry
     assert len(registry) == 5
+
+
+def test_guppy_is_manual_legacy() -> None:
+    """The unified EOD strategy owns the 15:35 slot; Guppy must not auto-run."""
+    meta = GuppyCompressionStrategy().metadata
+    assert meta.schedule_type == "manual"
+    assert meta.run_at is None
 
 
 # -- setup classification ---------------------------------------------------

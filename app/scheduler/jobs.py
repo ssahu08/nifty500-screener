@@ -10,7 +10,7 @@ Auto-strategies come in two flavours:
 
 * **interval** - ``frequency_minutes`` set, runs while the market is open;
 * **daily** - ``run_at`` ("HH:MM" IST) set, runs once per trading day near
-  that time (e.g. the 15:20 EOD compression scan).
+  that time (e.g. the 15:35 EOD compression scan).
 
 Strategies may override :meth:`~app.strategies.base.Strategy.prefilter` to
 prune their universe with batched realtime quotes before any candle history

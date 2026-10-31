@@ -1,34 +1,40 @@
-"""Strategy 5: EOD Compression & Pipe Ignition Breakout ("day-before & live explosion") - v3.
+"""Strategy 5: unified EOD compression, Guppy ribbon and RSI(9) trigger.
 
-Drop-in replacement for compression.py. Preserves all framework hooks,
-imports, and Signal metadata keys while fixing the 6 recall bottlenecks
-identified across empirical NSE winners (HBLENGINE, AARTIDRUGS, PATANJALI,
-SHOPERSTOP, TEAMLEASE, AEGISVOPAK, INFY, HINDPETRO, KOTAKBANK, ABDL):
+This replaces the earlier v3 compression engine with a single, dual-bar EOD
+strategy built around:
 
-1. Dual-Path Bollinger Squeeze Gate: Passes if bandwidth <= 65% of rolling
-   median OR if absolute bandwidth is already ultra-tight (<= 1.85% on 10m,
-   <= 3.20% on 1h), preventing multi-day squeezes from self-rejecting.
-2. Safe Rolling Lookbacks: Lowered SQUEEZE_MIN_PERIODS (40 on 10m, 10 on 1h)
-   so standard intraday fetch windows never return NaN median_width.
-3. Shrinking-ATR & Micro-Tick Fix: Measures thin bars / Dojis against a
-   50-bar baseline ATR, candle body-to-range ratio (<= 0.22), OR price
-   percentage (<= 0.18% of close) so prolonged pipes don't penalize themselves.
-4. Three Actionable Detection Modes (`setup_type` in metadata):
-   - "EOD_COIL": Currently coiled inside the flat box (BTST pre-breakout).
-   - "BOX_IGNITION": Prior 15 bars coiled in a flat box and current bar
-     just broke above the box ceiling with volume & RSI(9) momentum.
-   - "SPRING_RECLAIM": Post-coil morning shakeout dip (like PATANJALI) that
-     just flipped Supertrend bullish or reclaimed the box midline.
-5. Shakeout-Proof Stop Loss: Adds structural ATR(50) / 1.5% breathing room
-   on EOD_COIL trades to survive morning stop-hunts, plus Target 1 & Target 2.
-6. Multi-Timeframe Deduplication & Bonus: Evaluates both 10m and resampled 1h;
-   if both pass for the same symbol, keeps the stronger signal and awards a
-   +5.0 pt MTF Confluence Bonus.
+* a **21-period Bollinger middle band** (the reference / trigger line);
+* the **12-EMA Guppy ribbon** (fast 3/5/8/10/12/15, slow 30/35/40/45/50/60);
+* **RSI(9)** with EMA(3) vs SMA(21) confirmation.
+
+The scan runs at **15:35 IST** and evaluates two snapshots of the closing
+session: the **15:05** continuous bar and the **15:25** closing-auction print.
+The flat 15:15 auction-window artifact is skipped. The 15:05 snapshot is used
+for flat coils, staircase coils and box ignitions; the 15:25 snapshot is used
+only for midline reclaims, short breakdowns and staircase reclaims where the
+15:05 close was below the 21-MA.
+
+Only actionable **BUY-band** signals (score >= 72) are emitted, at most 15 per
+run, stamped with the candle's own timestamp rather than the scan time.
+
+Archetypes:
+  * ``STAIRCASE_COIL``  - morning impulse then a tight afternoon pipe holding
+    the 21-MA / fast ribbon.
+  * ``FLAT_COIL``       - tight flat pipe at/above the 21-MA with a rising
+    ribbon and no morning impulse.
+  * ``BOX_IGNITION``    - close above a prior coiled box on >= 1.5x volume.
+  * ``MIDLINE_RECLAIM`` - 15:05 below the 21-MA, 15:25 reclaims it green.
+  * ``SHORT_BREAKDOWN`` - 15:05 above the 21-MA, 15:25 breaks a prior coiled
+    box on >= 1.5x volume with RSI rolling over.
+
+There is no absolute-bandwidth free pass: every setup must clear a relative
+squeeze gate measured against the rolling median bandwidth.
 """
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -38,147 +44,128 @@ from app.core.logging import get_logger
 from app.core.market import next_trading_day
 from app.data.provider import Quote, normalize_symbol
 from app.strategies.base import Category, Signal, Strategy, StrategyMetadata
-from app.strategies.indicators import atr, bollinger, closed_candles, rsi, supertrend
+from app.strategies.indicators import atr, bollinger, closed_candles, rsi
 
 logger = get_logger(__name__)
 
 IST = ZoneInfo("Asia/Kolkata")
 
 # -- compression box --------------------------------------------------------
-#: Bars in the box per timeframe: 15 x 10m = 2.5h, 3 x 1h = 3h.
-BOX_BARS = {"10m": 15, "1h": 3}
-#: Hard gate: box height as a fraction of the last close (2.2% on 10m, 3.0% on 1h).
-MAX_BOX_RANGE_PCT = 0.022
-MAX_BOX_RANGE_BY_TF = {"10m": 0.022, "1h": 0.030}
+#: Bars in the standard afternoon box (15 x 10m = 2.5h).
+BOX_BARS = 15
+#: Per-archetype hard box gates (box height as a fraction of the last close).
+STAIRCASE_BOX_MAX = 0.0100
+FLAT_BOX_MAX = 0.0100
+RECLAIM_BOX_MAX = 0.0105
+IGNITION_PRIOR_BOX_MAX = 0.0120
+SHORT_PRIOR_BOX_MAX = 0.0120
 
 # -- Bollinger squeeze ------------------------------------------------------
-BOLLINGER_PERIOD = 20
+BOLLINGER_PERIOD = 21
 BOLLINGER_NUM_STD = 2.0
-#: Rolling window for the median bandwidth (~10 sessions per timeframe).
-SQUEEZE_LOOKBACK = {"10m": 370, "1h": 60}
-#: Lowered min_periods so 60-140 bar intraday histories never fail with NaN.
-SQUEEZE_MIN_PERIODS = {"10m": 40, "1h": 10}
-#: Relative squeeze threshold: current bandwidth <= 65% of rolling median.
-SQUEEZE_MAX_RATIO = 0.65
-#: Absolute bandwidth fallback (fraction of middle band): passes multi-day pipes
-#: even when the rolling median has already been dragged down by prior flat days.
-ABS_SQUEEZE_MAX_BW = {"10m": 0.0185, "1h": 0.0320}
+#: Rolling window for the median bandwidth (~10 sessions of 10m bars).
+SQUEEZE_LOOKBACK = 370
+#: Lowered min_periods so shorter intraday histories still return a median.
+SQUEEZE_MIN_PERIODS = 40
+#: Relative squeeze gates: current bandwidth / rolling median bandwidth.
+STAIRCASE_SQUEEZE_MAX = 0.65
+FLAT_SQUEEZE_MAX = 0.50
+RECLAIM_SQUEEZE_MAX = 0.60
+IGNITION_SQUEEZE_MAX = 0.65
+SHORT_SQUEEZE_MAX = 0.65
+#: Nozzle gates: current bandwidth / max bandwidth of the prior 50 bars.
+STAIRCASE_NOZZLE_MAX = 0.35
+FLAT_NOZZLE_MAX = 0.35
+RECLAIM_NOZZLE_MAX = 0.35
+IGNITION_NOZZLE_MAX = 0.30
+SHORT_NOZZLE_MAX = 0.55
 
-# -- scoring: weights (sum = 100 base + up to 5 MTF bonus, capped at 100) ---
-# A. compression quality (24)
-A_BOX_POINTS = 10.0
-A_BOX_BEST_PCT = 0.006
-A_SQUEEZE_POINTS = 8.0
-A_SQUEEZE_BEST_RATIO = 0.28
-A_THIN_POINTS = 6.0
-THIN_BODY_ATR = 0.42
-THIN_BODY_PRICE_PCT = 0.0018  # 0.18% of price = visual flat dash on chart
-THIN_DOJI_RATIO = 0.22        # Body <= 22% of High-Low range
-
-# B. absorption / accumulation evidence (26)
-B_PAR_POINTS = 10.0
-PAR_BEST = 1.60
-PAR_WORST = 0.90
-B_WICK_POINTS = 8.0
-WICK_BEST = 1.25
-WICK_WORST = 0.85
-B_POS_POINTS = 8.0
-POS_WORST = 0.30
-POS_BEST = 0.90
-
-# C. intraday timing & Zerodha RSI(9) subpanel (26 + 6 ignition bonus)
-C_RSI_POINTS = 10.0
+# -- trigger gates ----------------------------------------------------------
+STAIRCASE_MIN_IMPULSE = 0.012
+LONG_RSI_MIN = 48.0
+LONG_RSI_MAX = 78.0
+SHORT_RSI_MAX = 47.0
 RSI9_PERIOD = 9
-RSI9_PEAK = 55.0
-RSI9_SPAN = 20.0              # Widened to [35..75] so SHOPERSTOP/TEAMLEASE score well
-C_RSI_CROSS_POINTS = 6.0
-C_RSI_CURL_POINTS = 4.0       # Partial credit when EMA3 is curling up toward SMA21
-C_ST_POINTS = 6.0
-C_ST_NEAR_POINTS = 4.5        # AEGISVOPAK fix: coiled just below red ST flip line
-ST_NEAR_PCT = 0.018
-C_VWAP_POINTS = 4.0
-VWAP_BARS = 25
-#: Cap for score C = 26 base + 6 live-ignition volume bonus.
-C_MAX_POINTS = 26.0 + 6.0
+RSI_CROSS_TOLERANCE = 2.0
+SHORT_RSI_CROSS_TOLERANCE = 1.0
+IGNITION_MIN_BREAK = 0.001
+SHORT_MIN_BREAK = -0.0015
+IGNITION_MIN_VOL = 1.5
+SHORT_MIN_VOL = 1.5
 
-# D. daily context & narrow-range pedestal (24)
-D_TREND_POINTS = 6.0
-D_TREND_PARTIAL_POINTS = 3.5
-D_52W_POINTS = 6.0
-D_52W_BEST = 0.03
-D_52W_WORST = 0.30
+# -- scoring: weights (sum = 100 before the 100-point cap) ------------------
+# A. compression quality (32)
+A_BOX_POINTS = 12.0
+A_BOX_WORST = 0.0110
+A_BOX_BEST = 0.0050
+A_SQUEEZE_POINTS = 10.0
+A_SQUEEZE_WORST = 0.700
+A_SQUEEZE_BEST = 0.250
+A_NOZZLE_POINTS = 6.0
+A_NOZZLE_WORST = 0.600
+A_NOZZLE_BEST = 0.080
+A_THIN_POINTS = 4.0
+THIN_BODY_ATR = 0.42
+THIN_BODY_PRICE_PCT = 0.0018
+THIN_DOJI_RATIO = 0.22
+
+# B. setup / trigger quality (up to 43)
+B_SETUP_POINTS = {
+    "STAIRCASE_COIL": 19.0,
+    "FLAT_COIL": 15.0,
+    "BOX_IGNITION": 15.0,
+    "MIDLINE_RECLAIM": 20.0,
+    "SHORT_BREAKDOWN": 21.0,
+}
+B_RSI_POINTS = 8.0
+B_RSI_CROSS_POINTS = 6.0
+B_RSI_PARTIAL_POINTS = 3.0
+B_RSI_CROSS_WEAK_POINTS = 2.0
+B_RIBBON_POINTS = 8.0
+B_RIBBON_WEAK_POINTS = 3.0
+
+# C. participation / absorption (12)
+C_VOLUME_POINTS = 7.0
+C_ABSORPTION_POINTS = 5.0
+
+# D. daily context (18)
+D_TREND_POINTS = 5.0
+D_TREND_PARTIAL_POINTS = 2.5
+D_52W_POINTS = 5.0
 D_52W_BARS = 250
-D_BASE_POINTS = 6.0
+D_BASE_POINTS = 4.0
 D_BASE_MAX_DAYS = 3
-BASE_RANGE_ATR = 0.75         # Catches NR4/NR7 compression days reliably
-D_LIQ_POINTS = 6.0
+BASE_RANGE_ATR = 0.75
+D_LIQ_POINTS = 4.0
 LIQ_BEST_CR = 20.0
 LIQ_WORST_CR = 1.5
 LIQ_DAYS = 20
 
-# Bonus points for MTF (10m + 1h) confluence or live volume ignition
-MTF_CONFLUENCE_BONUS = 5.0
-IGNITION_VOL_BONUS = 6.0
-
-# -- bands ------------------------------------------------------------------
+# -- output -----------------------------------------------------------------
 BAND_BUY = "BUY"
-BAND_HOLD = "HOLD"
-BAND_SKIP = "SKIP"
-BAND_BUY_MIN = 68.0
-BAND_HOLD_MIN = 45.0
-
-# -- confluence indicators --------------------------------------------------
-SUPERTREND_PERIOD = 10
-SUPERTREND_MULTIPLIER = 3.0
+BAND_BUY_MIN = 72.0
+MAX_SIGNALS = 15
 
 # -- prefilter / data -------------------------------------------------------
-#: Raised to 5.5% so stocks that stepped up in the morning and coiled flat all
-#: afternoon (staircase pipes like INFY, HINDPETRO, KOTAKBANK) are never dropped.
-PREFILTER_DAY_RANGE_PCT = 5.5
-#: Minimum history before a timeframe can be evaluated.
-MIN_BARS = {"10m": 45, "1h": 14}
-#: Minimum completed daily bars before the daily context is trusted.
+PREFILTER_DAY_RANGE_PCT = 6.5
+MIN_BARS = 80
 MIN_DAILY_BARS = 40
-#: 10-minute bars per full hour (NSE session starts at 09:15).
-TEN_MIN_BARS_PER_HOUR = 6
-#: Entry/stop buffers around the box edges (fraction).
-ENTRY_BUFFER = 0.001
-STOP_BUFFER = 0.003
-#: Minimum stop distance for BTST EOD_COIL to survive morning stop-hunts (PATANJALI).
-MIN_BTST_STOP_PCT = 0.012
 
+# -- execution levels -------------------------------------------------------
+ENTRY_BUFFER = 0.0015
+LIMIT_SLIPPAGE_CAP = 0.0100
+STOP_BUFFER = 0.0030
+MIN_BTST_STOP_PCT = 0.0120
 
-def hourly_from_10m(df: pd.DataFrame) -> pd.DataFrame | None:
-    """Build NSE-aligned 1-hour candles from 10-minute data.
-
-    Bins start at 09:15; the partial current hour and the 15-minute closing
-    stub (fewer than six 10-minute bars) are dropped. Returns ``None`` when no
-    full hourly bar survives.
-    """
-    if df is None or df.empty:
-        return None
-    grouped = df.resample("1h", offset="15min")
-    counts = grouped["close"].count()
-    hourly = grouped.agg(
-        {
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum",
-        }
-    ).dropna(subset=["open"])
-    full_hours = counts.reindex(hourly.index) >= TEN_MIN_BARS_PER_HOUR
-    hourly = hourly[full_hours]
-    return hourly if not hourly.empty else None
+GMMA_FAST_PERIODS = (3, 5, 8, 10, 12, 15)
+GMMA_SLOW_PERIODS = (30, 35, 40, 45, 50, 60)
 
 
 def _ramp(value: float, worst: float, best: float) -> float:
     """Linear 0..1 ramp from ``worst`` to ``best`` (either direction)."""
     if worst == best:
         return 0.0
-    fraction = (value - worst) / (best - worst)
-    return max(0.0, min(1.0, fraction))
+    return max(0.0, min(1.0, (value - worst) / (best - worst)))
 
 
 def _daily_context(daily: pd.DataFrame | None, today: date) -> pd.DataFrame | None:
@@ -194,22 +181,38 @@ def _daily_context(daily: pd.DataFrame | None, today: date) -> pd.DataFrame | No
     return frame if len(frame) >= MIN_DAILY_BARS else None
 
 
-def _daily_scores(daily: pd.DataFrame, close: float) -> tuple[float, dict]:
-    """Daily-context score (24 pts max) plus the underlying measurements."""
-    days = daily["close"].ewm(span=20, adjust=False).mean()
-    slow = daily["close"].ewm(span=50, adjust=False).mean()
-    ema20, ema50 = float(days.iloc[-1]), float(slow.iloc[-1])
+def _daily_scores(
+    daily: pd.DataFrame,
+    close: float,
+    direction: str,
+) -> tuple[float, dict]:
+    """Daily-context score (18 pts max) plus the underlying measurements."""
+    ema20 = float(daily["close"].ewm(span=20, adjust=False).mean().iloc[-1])
+    ema50 = float(daily["close"].ewm(span=50, adjust=False).mean().iloc[-1])
 
-    if close > ema20 and ema20 > ema50:
-        trend_points = D_TREND_POINTS
-    elif close >= ema20 * 0.985:
-        trend_points = D_TREND_PARTIAL_POINTS
+    if direction == "LONG":
+        if close > ema20 and ema20 > ema50:
+            trend_points = D_TREND_POINTS
+        elif close >= ema20 * 0.985:
+            trend_points = D_TREND_PARTIAL_POINTS
+        else:
+            trend_points = 0.0
     else:
-        trend_points = 0.0
+        if close < ema20 and ema20 < ema50:
+            trend_points = D_TREND_POINTS
+        elif close <= ema20 * 1.015:
+            trend_points = D_TREND_PARTIAL_POINTS
+        else:
+            trend_points = 0.0
 
     high_52w = float(daily["high"].tail(D_52W_BARS).max())
     dist_52w = (high_52w - close) / high_52w if high_52w > 0 else 1.0
-    high_points = D_52W_POINTS * _ramp(dist_52w, D_52W_WORST, D_52W_BEST)
+    if direction == "LONG":
+        high_points = D_52W_POINTS * _ramp(dist_52w, 0.30, 0.03)
+    else:
+        # A fresh breakdown from near the 52-week high has the most room;
+        # a stock already 20% off its high is late/extended.
+        high_points = D_52W_POINTS * _ramp(dist_52w, 0.20, 0.02)
 
     ranges = daily["high"] - daily["low"]
     atr_daily = atr(daily, 14)
@@ -222,16 +225,16 @@ def _daily_scores(daily: pd.DataFrame, close: float) -> tuple[float, dict]:
         if base_days >= 10:
             break
 
-    # Also award base points if the stock had a strong prior pedestal impulse
-    # (+3.5% day in the last 10 sessions) even if the current base is short.
     recent_10d_rets = daily["close"].pct_change().tail(10)
-    had_pedestal_impulse = bool((recent_10d_rets >= 0.035).any())
-    effective_base_days = max(base_days, 2 if had_pedestal_impulse else 0)
+    if direction == "LONG":
+        pedestal = bool((recent_10d_rets >= 0.028).any())
+    else:
+        pedestal = bool((recent_10d_rets <= -0.022).any())
+
+    effective_base_days = max(base_days, 2 if pedestal else 0)
     base_points = D_BASE_POINTS * min(effective_base_days, D_BASE_MAX_DAYS) / D_BASE_MAX_DAYS
 
-    turnover_cr = float(
-        (daily["close"] * daily["volume"]).tail(LIQ_DAYS).mean() / 1e7
-    )
+    turnover_cr = float((daily["close"] * daily["volume"]).tail(LIQ_DAYS).mean() / 1e7)
     liq_points = D_LIQ_POINTS * _ramp(turnover_cr, LIQ_WORST_CR, LIQ_BEST_CR)
 
     detail = {
@@ -239,29 +242,634 @@ def _daily_scores(daily: pd.DataFrame, close: float) -> tuple[float, dict]:
         "ema50": round(ema50, 2),
         "dist_52w_pct": round(dist_52w * 100.0, 1),
         "base_days": base_days,
-        "pedestal_impulse": had_pedestal_impulse,
+        "pedestal_impulse": pedestal,
         "turnover_cr": round(turnover_cr, 1),
     }
     return trend_points + high_points + base_points + liq_points, detail
 
 
+@dataclass(frozen=True)
+class _Snapshot:
+    """All measurements for one evaluation candle."""
+
+    timestamp: datetime
+    last: float
+    open: float
+    high: float
+    low: float
+    green: bool
+    mid: float
+    upper: float
+    lower: float
+    pct_b: float
+    bandwidth: float
+    squeeze: float
+    nozzle: float
+    box_high: float
+    box_low: float
+    box_range_pct: float
+    box_position: float
+    thin_density: float
+    prior_high: float
+    prior_low: float
+    prior_box_pct: float
+    prior_box_position: float
+    prior_squeeze: float
+    prior_nozzle: float
+    prior_thin_density: float
+    up_break: float
+    dn_break: float
+    fast_mean: float
+    slow_mean: float
+    fast_max: float
+    fast_min: float
+    slow_max: float
+    slow_min: float
+    total_spread: float
+    slow_slope: float
+    rsi: float
+    rsi_ema3: float
+    rsi_ema3_prev: float
+    rsi_sma21: float
+    vol_ratio: float
+    par20_long: float
+    par20_short: float
+    pos: float
+    day_open: float
+    day_high: float
+    day_low: float
+    day_impulse: float
+    day_high_dist: float
+    day_low_dist: float
+    wick_ratio_long: float
+    wick_ratio_short: float
+
+
+@dataclass(frozen=True)
+class _Candidate:
+    """A gate-passing setup, with the box used for scoring."""
+
+    setup_type: str
+    direction: str
+    snapshot: _Snapshot
+    trigger_bar: str
+    box_high: float
+    box_low: float
+    box_range_pct: float
+    box_position: float
+    squeeze: float
+    nozzle: float
+    thin_density: float
+
+
+def _nozzle(series: pd.Series, position: int) -> float:
+    """Current bandwidth / max bandwidth of the prior 50 bars."""
+    if position <= 0:
+        return 9.9
+    start = max(0, position - 50)
+    peak = float(series.iloc[start:position].max())
+    current = float(series.iloc[position])
+    if pd.isna(peak) or peak <= 0 or pd.isna(current):
+        return 9.9
+    return current / peak
+
+
+def _box_metrics(box: pd.DataFrame, close: float) -> tuple[float, float, float, float]:
+    high = float(box["high"].max())
+    low = float(box["low"].min())
+    span = high - low
+    if span <= 0 or close <= 0:
+        return high, low, 999.0, 0.5
+    position = max(0.0, min(1.0, (close - low) / span))
+    return high, low, span / close, position
+
+
+def _thin_density(box: pd.DataFrame, frame: pd.DataFrame) -> float:
+    period = min(50, max(2, len(frame) - 2))
+    atr_series = atr(frame, period).reindex(box.index)
+    bodies = (box["close"] - box["open"]).abs()
+    ranges = (box["high"] - box["low"]).replace(0.0, float("nan"))
+    thin = (
+        ((bodies <= THIN_BODY_ATR * atr_series) & atr_series.notna())
+        | ((bodies / box["close"]) <= THIN_BODY_PRICE_PCT)
+        | ((bodies / ranges).fillna(0.0) <= THIN_DOJI_RATIO)
+    )
+    return float(thin.mean()) if len(thin) else 0.0
+
+
+def _as_datetime(value) -> datetime:
+    timestamp = value.to_pydatetime() if isinstance(value, pd.Timestamp) else value
+    if timestamp.tzinfo is None:
+        return timestamp.replace(tzinfo=IST)
+    return timestamp.astimezone(IST)
+
+
+def _snapshot(df: pd.DataFrame | None) -> _Snapshot | None:
+    """Compute every metric used by the archetype gates."""
+    if df is None or len(df) < MIN_BARS:
+        return None
+    frame = df[~df.index.duplicated(keep="last")].sort_index()
+    last_close = float(frame["close"].iloc[-1])
+    last_open = float(frame["open"].iloc[-1])
+    if last_close <= 0:
+        return None
+
+    bb = bollinger(frame, BOLLINGER_PERIOD, BOLLINGER_NUM_STD)
+    mid = float(bb["middle"].iloc[-1])
+    upper = float(bb["upper"].iloc[-1])
+    lower = float(bb["lower"].iloc[-1])
+    bandwidth = bb["bandwidth"]
+    current_bw = float(bandwidth.iloc[-1])
+    if any(pd.isna(value) for value in (mid, upper, lower, current_bw)):
+        return None
+
+    min_periods = min(SQUEEZE_MIN_PERIODS, max(10, len(frame) // 2))
+    median_series = bandwidth.rolling(SQUEEZE_LOOKBACK, min_periods=min_periods).median()
+    median = float(median_series.iloc[-1])
+    if pd.isna(median) or median <= 0:
+        median = float(bandwidth.tail(30).median())
+    if pd.isna(median) or median <= 0:
+        return None
+    squeeze = current_bw / median
+
+    prior_bw = float(bandwidth.iloc[-2]) if len(bandwidth) >= 2 else current_bw
+    prior_median = float(median_series.iloc[-2]) if len(median_series) >= 2 else median
+    if pd.isna(prior_median) or prior_median <= 0:
+        prior_median = median
+    prior_squeeze = prior_bw / prior_median
+    nozzle = _nozzle(bandwidth, len(bandwidth) - 1)
+    prior_nozzle = _nozzle(bandwidth, len(bandwidth) - 2)
+
+    box = frame.iloc[-BOX_BARS:]
+    prior_box = frame.iloc[-(BOX_BARS + 1) : -1]
+    box_high, box_low, box_range_pct, box_position = _box_metrics(box, last_close)
+    prior_high, prior_low, prior_box_pct, prior_box_position = _box_metrics(
+        prior_box, last_close
+    )
+    thin_density = _thin_density(box, frame)
+    prior_thin_density = _thin_density(prior_box, frame)
+
+    close = frame["close"]
+    fast_series = [close.ewm(span=period, adjust=False).mean() for period in GMMA_FAST_PERIODS]
+    slow_series = [close.ewm(span=period, adjust=False).mean() for period in GMMA_SLOW_PERIODS]
+    fast_values = [float(series.iloc[-1]) for series in fast_series]
+    slow_values = [float(series.iloc[-1]) for series in slow_series]
+    fast_mean = sum(fast_values) / len(fast_values)
+    slow_mean = sum(slow_values) / len(slow_values)
+    fast_max, fast_min = max(fast_values), min(fast_values)
+    slow_max, slow_min = max(slow_values), min(slow_values)
+    total_spread = (
+        (max(fast_max, slow_max) - min(fast_min, slow_min)) / last_close
+        if last_close > 0
+        else 1.0
+    )
+    slow_prev_mean = (
+        sum(float(series.iloc[-16]) for series in slow_series) / len(slow_series)
+        if len(frame) >= 16
+        else slow_mean
+    )
+    slow_slope = (
+        (slow_mean - slow_prev_mean) / slow_prev_mean if slow_prev_mean > 0 else 0.0
+    )
+
+    rsi_series = rsi(frame, RSI9_PERIOD)
+    rsi9 = float(rsi_series.iloc[-1])
+    rsi_ema3_series = rsi_series.ewm(span=3, adjust=False).mean()
+    rsi_ema3 = float(rsi_ema3_series.iloc[-1])
+    rsi_ema3_prev = (
+        float(rsi_ema3_series.iloc[-2]) if len(rsi_ema3_series) >= 2 else rsi_ema3
+    )
+    rsi_sma21 = float(rsi_series.rolling(21, min_periods=5).mean().iloc[-1])
+    if pd.isna(rsi9) or pd.isna(rsi_sma21):
+        return None
+
+    vol_sma = float(frame["volume"].iloc[-21:-1].mean()) if len(frame) >= 21 else 0.0
+    vol_ratio = float(frame["volume"].iloc[-1] / vol_sma) if vol_sma > 0 else 1.0
+
+    last20 = frame.iloc[-20:]
+    bar_mid = (last20["high"] + last20["low"]) / 2.0
+    up_bars = (last20["close"] >= last20["open"]) | (last20["close"] >= bar_mid)
+    up_volume = float(last20.loc[up_bars, "volume"].sum())
+    down_volume = float(last20.loc[~up_bars, "volume"].sum())
+    par20_long = up_volume / down_volume if down_volume > 0 else 3.0
+    par20_short = down_volume / up_volume if up_volume > 0 else 3.0
+
+    lower_wick = (box[["open", "close"]].min(axis=1) - box["low"]).mean()
+    upper_wick = (box["high"] - box[["open", "close"]].max(axis=1)).mean()
+    wick_ratio_long = float(lower_wick / upper_wick) if upper_wick > 0 else 3.0
+    wick_ratio_short = float(upper_wick / lower_wick) if lower_wick > 0 else 3.0
+
+    tail = frame.tail(108)
+    tail_high = float(tail["high"].max())
+    tail_low = float(tail["low"].min())
+    pos = (
+        max(0.0, min(1.0, (last_close - tail_low) / (tail_high - tail_low)))
+        if tail_high > tail_low
+        else 0.5
+    )
+
+    last_date = frame.index[-1].date()
+    day = frame[frame.index.date == last_date]
+    if day.empty:  # pragma: no cover - defensive
+        day = frame.tail(1)
+    day_open = float(day["open"].iloc[0])
+    day_high = float(day["high"].max())
+    day_low = float(day["low"].min())
+    day_impulse = (day_high - day_open) / day_open if day_open > 0 else 0.0
+    day_high_dist = (day_high - last_close) / day_high if day_high > 0 else 0.0
+    day_low_dist = (last_close - day_low) / day_low if day_low > 0 else 0.0
+
+    span = upper - lower
+    pct_b = (last_close - lower) / span if span > 0 else 0.5
+
+    return _Snapshot(
+        timestamp=_as_datetime(frame.index[-1]),
+        last=last_close,
+        open=last_open,
+        high=float(frame["high"].iloc[-1]),
+        low=float(frame["low"].iloc[-1]),
+        green=last_close >= last_open,
+        mid=mid,
+        upper=upper,
+        lower=lower,
+        pct_b=pct_b,
+        bandwidth=current_bw,
+        squeeze=squeeze,
+        nozzle=nozzle,
+        box_high=box_high,
+        box_low=box_low,
+        box_range_pct=box_range_pct,
+        box_position=box_position,
+        thin_density=thin_density,
+        prior_high=prior_high,
+        prior_low=prior_low,
+        prior_box_pct=prior_box_pct,
+        prior_box_position=prior_box_position,
+        prior_squeeze=prior_squeeze,
+        prior_nozzle=prior_nozzle,
+        prior_thin_density=prior_thin_density,
+        up_break=(last_close - prior_high) / prior_high if prior_high > 0 else 0.0,
+        dn_break=(last_close - prior_low) / prior_low if prior_low > 0 else 0.0,
+        fast_mean=fast_mean,
+        slow_mean=slow_mean,
+        fast_max=fast_max,
+        fast_min=fast_min,
+        slow_max=slow_max,
+        slow_min=slow_min,
+        total_spread=total_spread,
+        slow_slope=slow_slope,
+        rsi=rsi9,
+        rsi_ema3=rsi_ema3,
+        rsi_ema3_prev=rsi_ema3_prev,
+        rsi_sma21=rsi_sma21,
+        vol_ratio=vol_ratio,
+        par20_long=par20_long,
+        par20_short=par20_short,
+        pos=pos,
+        day_open=day_open,
+        day_high=day_high,
+        day_low=day_low,
+        day_impulse=day_impulse,
+        day_high_dist=day_high_dist,
+        day_low_dist=day_low_dist,
+        wick_ratio_long=wick_ratio_long,
+        wick_ratio_short=wick_ratio_short,
+    )
+
+
+def _long_rsi(m: _Snapshot) -> bool:
+    return (
+        LONG_RSI_MIN <= m.rsi <= LONG_RSI_MAX
+        and m.rsi_ema3 > m.rsi_ema3_prev
+        and (m.rsi_ema3 >= m.rsi_sma21 - RSI_CROSS_TOLERANCE or m.rsi >= m.rsi_sma21)
+    )
+
+
+def _short_rsi(m: _Snapshot) -> bool:
+    return (
+        m.rsi <= SHORT_RSI_MAX
+        and m.rsi_ema3 < m.rsi_ema3_prev
+        and (
+            m.rsi_ema3 <= m.rsi_sma21 + SHORT_RSI_CROSS_TOLERANCE
+            or m.rsi <= m.rsi_sma21
+        )
+    )
+
+
+def _staircase(m: _Snapshot, prev: _Snapshot | None) -> bool:
+    """Morning impulse then a tight afternoon pipe holding the 21-MA."""
+    # The 15:25 auction bar may only confirm a reclaim when 15:05 was below
+    # the mid-line. It cannot turn a marginal coil into a fresh BUY.
+    if prev is not None and prev.last >= prev.mid:
+        return False
+    return (
+        m.day_impulse >= STAIRCASE_MIN_IMPULSE
+        and m.box_range_pct <= STAIRCASE_BOX_MAX
+        and m.squeeze <= STAIRCASE_SQUEEZE_MAX
+        and m.nozzle <= STAIRCASE_NOZZLE_MAX
+        and m.last >= m.mid * 0.9985
+        and m.last >= m.fast_mean * 0.999
+        and m.pct_b >= 0.30
+        and _long_rsi(m)
+        and m.fast_mean >= m.slow_mean * 0.999
+        and m.slow_slope >= -0.0005
+        and m.pos >= 0.55
+        and m.day_high_dist <= 0.015
+    )
+
+
+def _flat_coil(m: _Snapshot) -> bool:
+    """Flat afternoon pipe at/above the 21-MA with a rising ribbon."""
+    return (
+        m.day_impulse < STAIRCASE_MIN_IMPULSE
+        and m.box_range_pct <= FLAT_BOX_MAX
+        and m.squeeze <= FLAT_SQUEEZE_MAX
+        and m.nozzle <= FLAT_NOZZLE_MAX
+        and m.last >= m.mid * 0.999
+        and m.pct_b >= 0.55
+        and 52.0 <= m.rsi <= 75.0
+        and m.rsi_ema3 >= m.rsi_sma21 - 1.5
+        and m.rsi_ema3 > m.rsi_ema3_prev
+        and m.fast_mean >= m.slow_mean
+        and m.slow_slope >= 0.0
+        and m.pos >= 0.65
+        and m.day_high_dist <= 0.010
+        and m.green
+    )
+
+
+def _midline_reclaim(m: _Snapshot, prev: _Snapshot) -> bool:
+    """15:05 below the 21-MA, 15:25 reclaims it with a green bar."""
+    return (
+        prev.last < prev.mid
+        and m.last >= m.mid * 0.999
+        and m.green
+        and m.box_range_pct <= RECLAIM_BOX_MAX
+        and m.squeeze <= RECLAIM_SQUEEZE_MAX
+        and m.nozzle <= RECLAIM_NOZZLE_MAX
+        and m.pct_b >= 0.55
+        and 50.0 <= m.rsi <= 78.0
+        and m.rsi_ema3 > m.rsi_ema3_prev
+        and (m.last >= m.fast_max * 0.999 or m.total_spread <= 0.008)
+        and m.day_high_dist <= 0.015
+    )
+
+
+def _box_ignition(m: _Snapshot) -> bool:
+    """Close above a prior coiled box on >= 1.5x volume."""
+    return (
+        m.prior_box_pct <= IGNITION_PRIOR_BOX_MAX
+        and m.prior_squeeze <= IGNITION_SQUEEZE_MAX
+        and m.prior_nozzle <= IGNITION_NOZZLE_MAX
+        and m.up_break >= IGNITION_MIN_BREAK
+        and m.vol_ratio >= IGNITION_MIN_VOL
+        and 52.0 <= m.rsi <= 78.0
+        and m.rsi_ema3 >= m.rsi_sma21 - 1.0
+        and m.rsi_ema3 > m.rsi_ema3_prev
+        and m.fast_mean >= m.slow_mean
+        and m.slow_slope >= 0.0
+        and m.pct_b >= 0.65
+        and m.green
+    )
+
+
+def _short_breakdown(m: _Snapshot, prev: _Snapshot) -> bool:
+    """15:05 above the 21-MA, 15:25 breaks a prior coiled box on volume."""
+    return (
+        prev.last >= prev.mid * 0.999
+        and m.last < m.mid * 0.999
+        and m.prior_box_pct <= SHORT_PRIOR_BOX_MAX
+        and m.prior_squeeze <= SHORT_SQUEEZE_MAX
+        and m.prior_nozzle <= SHORT_NOZZLE_MAX
+        and m.dn_break <= SHORT_MIN_BREAK
+        and m.vol_ratio >= SHORT_MIN_VOL
+        and _short_rsi(m)
+        and m.fast_mean <= m.slow_mean * 1.001
+        and m.slow_slope <= 0.001
+        and m.pct_b <= 0.35
+        and not m.green
+        and m.pos <= 0.45
+    )
+
+
+def _candidate(
+    setup_type: str,
+    direction: str,
+    m: _Snapshot,
+    *,
+    prior_box: bool = False,
+) -> _Candidate:
+    trigger_bar = m.timestamp.strftime("%H:%M")
+    if prior_box:
+        return _Candidate(
+            setup_type=setup_type,
+            direction=direction,
+            snapshot=m,
+            trigger_bar=trigger_bar,
+            box_high=m.prior_high,
+            box_low=m.prior_low,
+            box_range_pct=m.prior_box_pct,
+            box_position=m.prior_box_position,
+            squeeze=m.prior_squeeze,
+            nozzle=m.prior_nozzle,
+            thin_density=m.prior_thin_density,
+        )
+    return _Candidate(
+        setup_type=setup_type,
+        direction=direction,
+        snapshot=m,
+        trigger_bar=trigger_bar,
+        box_high=m.box_high,
+        box_low=m.box_low,
+        box_range_pct=m.box_range_pct,
+        box_position=m.box_position,
+        squeeze=m.squeeze,
+        nozzle=m.nozzle,
+        thin_density=m.thin_density,
+    )
+
+
+def _match_candidates(m05: _Snapshot, m25: _Snapshot | None) -> list[_Candidate]:
+    """Run the archetype gates on both EOD snapshots."""
+    candidates: list[_Candidate] = []
+
+    # 15:05 continuous bar: staircase, flat coil, or a live box breakout.
+    # A stock already in a tight coil is reported as the coil (the earlier,
+    # higher-quality setup) rather than as a same-bar ignition.
+    if _staircase(m05, None):
+        candidates.append(_candidate("STAIRCASE_COIL", "LONG", m05))
+    elif _flat_coil(m05):
+        candidates.append(_candidate("FLAT_COIL", "LONG", m05))
+    elif _box_ignition(m05):
+        candidates.append(_candidate("BOX_IGNITION", "LONG", m05, prior_box=True))
+
+    # 15:25 closing print: only state transitions / reclaims, never a fresh coil.
+    if m25 is not None:
+        if _short_breakdown(m25, m05):
+            candidates.append(_candidate("SHORT_BREAKDOWN", "SHORT", m25, prior_box=True))
+        elif _staircase(m25, m05):
+            candidates.append(_candidate("STAIRCASE_COIL", "LONG", m25))
+        elif _midline_reclaim(m25, m05):
+            candidates.append(_candidate("MIDLINE_RECLAIM", "LONG", m25))
+
+    return candidates
+
+
+def _long_rsi_points(m: _Snapshot) -> float:
+    if 50.0 <= m.rsi <= 70.0:
+        return B_RSI_POINTS
+    if m.rsi < 50.0:
+        return B_RSI_POINTS * _ramp(m.rsi, 48.0, 50.0)
+    return B_RSI_POINTS * _ramp(m.rsi, 78.0, 70.0)
+
+
+def _short_rsi_points(m: _Snapshot) -> float:
+    if m.rsi <= SHORT_RSI_MAX:
+        return B_RSI_POINTS
+    return B_RSI_POINTS * _ramp(m.rsi, SHORT_RSI_MAX, 35.0)
+
+
+def _long_cross_points(m: _Snapshot) -> float:
+    if m.rsi_ema3 >= m.rsi_sma21:
+        return B_RSI_CROSS_POINTS
+    if m.rsi_ema3 >= m.rsi_sma21 - RSI_CROSS_TOLERANCE and m.rsi_ema3 > m.rsi_ema3_prev:
+        return B_RSI_PARTIAL_POINTS
+    if m.rsi >= m.rsi_sma21 and m.rsi_ema3 > m.rsi_ema3_prev:
+        return B_RSI_CROSS_WEAK_POINTS
+    return 0.0
+
+
+def _short_cross_points(m: _Snapshot) -> float:
+    if m.rsi_ema3 <= m.rsi_sma21:
+        return B_RSI_CROSS_POINTS
+    if (
+        m.rsi_ema3 <= m.rsi_sma21 + SHORT_RSI_CROSS_TOLERANCE
+        and m.rsi_ema3 < m.rsi_ema3_prev
+    ):
+        return B_RSI_PARTIAL_POINTS
+    return 0.0
+
+
+def _long_ribbon_points(m: _Snapshot) -> float:
+    if m.fast_mean >= m.slow_mean and m.slow_slope >= 0.0:
+        return B_RIBBON_POINTS
+    if m.fast_mean >= m.slow_mean:
+        return B_RIBBON_POINTS * 0.75
+    if m.last >= m.fast_max and m.total_spread <= 0.008:
+        return B_RIBBON_POINTS * 0.625
+    if m.total_spread <= 0.012:
+        return B_RIBBON_WEAK_POINTS
+    return 0.0
+
+
+def _short_ribbon_points(m: _Snapshot) -> float:
+    if m.fast_mean <= m.slow_mean * 1.001 and m.slow_slope <= 0.001:
+        return B_RIBBON_POINTS
+    if m.fast_mean <= m.slow_mean * 1.005:
+        return B_RIBBON_POINTS * 0.625
+    return 0.0
+
+
+def _score(candidate: _Candidate, daily: pd.DataFrame | None) -> tuple[float, dict]:
+    """Compression-heavy 0-100 score for one gate-passing candidate."""
+    m = candidate.snapshot
+    score_a = (
+        A_BOX_POINTS * _ramp(candidate.box_range_pct, A_BOX_WORST, A_BOX_BEST)
+        + A_SQUEEZE_POINTS * _ramp(candidate.squeeze, A_SQUEEZE_WORST, A_SQUEEZE_BEST)
+        + A_NOZZLE_POINTS * _ramp(candidate.nozzle, A_NOZZLE_WORST, A_NOZZLE_BEST)
+        + A_THIN_POINTS * candidate.thin_density
+    )
+
+    setup_points = B_SETUP_POINTS[candidate.setup_type]
+    if candidate.direction == "LONG":
+        rsi_points = _long_rsi_points(m)
+        cross_points = _long_cross_points(m)
+        ribbon_points = _long_ribbon_points(m)
+        par20 = m.par20_long
+        wick_ratio = m.wick_ratio_long
+    else:
+        rsi_points = _short_rsi_points(m)
+        cross_points = _short_cross_points(m)
+        ribbon_points = _short_ribbon_points(m)
+        par20 = m.par20_short
+        wick_ratio = m.wick_ratio_short
+    score_b = setup_points + rsi_points + cross_points + ribbon_points
+
+    score_c = (
+        C_VOLUME_POINTS * _ramp(m.vol_ratio, 0.7, 1.8)
+        + C_ABSORPTION_POINTS * _ramp(par20, 0.8, 1.8)
+    )
+
+    if daily is not None:
+        score_d, daily_detail = _daily_scores(daily, m.last, candidate.direction)
+    else:
+        score_d, daily_detail = 0.0, {}
+    score = min(100.0, round(score_a + score_b + score_c + score_d, 1))
+
+    return score, {
+        "compression": round(score_a, 1),
+        "trigger": round(score_b, 1),
+        "participation": round(score_c, 1),
+        "daily": round(score_d, 1),
+        "daily_detail": daily_detail,
+        "par20": par20,
+        "wick_ratio": wick_ratio,
+    }
+
+
+def _closing_frame(
+    raw: pd.DataFrame | None,
+    base: pd.DataFrame | None,
+    now: datetime,
+) -> pd.DataFrame | None:
+    """Append the 15:25 closing-auction bar to the 15:05 continuous frame."""
+    if raw is None or raw.empty or base is None or base.empty:
+        return None
+    last_date = base.index[-1].date()
+    day = raw[raw.index.date == last_date]
+    if day.empty:
+        return None
+    closing = day[day.index.time == time(15, 25)]
+    if closing.empty:
+        return None
+    timestamp = closing.index[-1]
+    bar_end = timestamp + timedelta(minutes=10)
+    now_ts = pd.Timestamp(now)
+    if timestamp.tzinfo is not None:
+        now_ts = (
+            now_ts.tz_localize(timestamp.tzinfo)
+            if now_ts.tzinfo is None
+            else now_ts.tz_convert(timestamp.tzinfo)
+        )
+    elif now_ts.tzinfo is not None:
+        now_ts = now_ts.tz_localize(None)
+    if bar_end > now_ts:
+        return None
+
+    frame = base.copy()
+    for column in ("open", "high", "low", "close", "volume"):
+        frame.loc[timestamp, column] = float(closing.iloc[-1][column])
+    return frame.sort_index()
+
+
 class EodCompressionBreakoutStrategy(Strategy):
-    """EOD compression & live pipe-ignition scan over the Nifty 500 (10m + 1h)."""
+    """Dual-bar EOD 21-MA Bollinger + Guppy ribbon + RSI(9) scan."""
 
     @property
     def metadata(self) -> StrategyMetadata:
         return StrategyMetadata(
             name="EOD Compression Breakout",
             description=(
-                "High-recall EOD & intraday compression scanner: captures flat "
-                "institutional accumulation pipes (EOD_COIL), live pipe breakouts "
-                "(BOX_IGNITION), and post-coil shakeout flips (SPRING_RECLAIM)."
+                "Unified EOD compression scan: 21-period Bollinger mid-line, "
+                "12-EMA Guppy ribbon and RSI(9) trigger. Emits BUY-band LONG "
+                "staircase/flat coils, box ignitions and mid-line reclaims, "
+                "plus BUY-band SHORT breakdowns."
             ),
             category=Category.INTRADAY,
             universe="NIFTY_500",
             schedule_type="auto",
             timeframes=["10m", "daily"],
-            run_at="15:20",
+            run_at="15:35",
             candle_interval="10m",
         )
 
@@ -285,328 +893,179 @@ class EodCompressionBreakoutStrategy(Strategy):
         data: dict[str, dict[str, pd.DataFrame]],
         settings: Settings,
     ) -> list[Signal]:
-        now = datetime.now(IST)
+        return self._scan(data, settings, datetime.now(IST))
+
+    def _scan(
+        self,
+        data: dict[str, dict[str, pd.DataFrame]],
+        settings: Settings,
+        now: datetime,
+    ) -> list[Signal]:
         move_date = next_trading_day(now.date()).isoformat()
         signals: list[Signal] = []
 
         for symbol, frames in data.items():
             frames = frames or {}
-            ten_min = closed_candles(frames.get("10m"), "10m", now)
-            if ten_min is None or ten_min.empty:
+            raw = frames.get("10m")
+            if raw is None or raw.empty:
                 continue
+            raw = raw[~raw.index.duplicated(keep="last")].sort_index()
+            base = closed_candles(raw, "10m", now)
+            if base is None or len(base) < MIN_BARS:
+                continue
+
             daily = _daily_context(frames.get("daily"), now.date())
+            m05 = _snapshot(base)
+            if m05 is None:
+                continue
+            closing = _closing_frame(raw, base, now)
+            m25 = _snapshot(closing) if closing is not None else None
 
-            candidates: list[tuple[str, pd.DataFrame]] = [("10m", ten_min)]
-            hourly = hourly_from_10m(ten_min)
-            if hourly is not None:
-                candidates.append(("1h", hourly))
+            candidates = _match_candidates(m05, m25)
+            if not candidates:
+                continue
+            # A confirmed breakdown at 15:25 invalidates an earlier long coil.
+            if any(candidate.direction == "SHORT" for candidate in candidates):
+                candidates = [
+                    candidate for candidate in candidates if candidate.direction == "SHORT"
+                ]
 
-            sym_signals: list[Signal] = []
-            for timeframe, frame in candidates:
-                sig = self._evaluate(symbol, timeframe, frame, daily, now, move_date)
-                if sig is not None:
-                    sym_signals.append(sig)
-
-            if not sym_signals:
+            scored: list[tuple[float, _Candidate, dict]] = []
+            for candidate in candidates:
+                score, detail = _score(candidate, daily)
+                if score >= BAND_BUY_MIN:
+                    scored.append((score, candidate, detail))
+            if not scored:
                 continue
 
-            # Dedup: both 10m and 1h fired -> keep the stronger signal and
-            # award the +5 pt MTF confluence bonus (tracked as score_bonus so
-            # the score components still add up to the total).
-            sym_signals.sort(key=lambda s: s.metadata.get("score", 0.0), reverse=True)
-            best_sig = sym_signals[0]
-            if len(sym_signals) > 1:
-                base_score = float(best_sig.metadata["score"])
-                boosted = min(100.0, round(base_score + MTF_CONFLUENCE_BONUS, 1))
-                best_sig.metadata["score_bonus"] = round(boosted - base_score, 1)
-                best_sig.metadata["score"] = boosted
-                best_sig.metadata["mtf_confluence"] = True
-                if boosted >= BAND_BUY_MIN:
-                    best_sig.metadata["band"] = BAND_BUY
-                elif boosted >= BAND_HOLD_MIN:
-                    best_sig.metadata["band"] = BAND_HOLD
-            else:
-                best_sig.metadata["score_bonus"] = 0.0
-                best_sig.metadata["mtf_confluence"] = False
+            scored.sort(
+                key=lambda item: (item[0], item[1].snapshot.timestamp),
+                reverse=True,
+            )
+            score, candidate, detail = scored[0]
+            signals.append(
+                self._build_signal(
+                    symbol,
+                    candidate,
+                    score,
+                    detail,
+                    move_date,
+                    dual_bar=m25 is not None,
+                )
+            )
 
-            signals.append(best_sig)
+        signals.sort(
+            key=lambda signal: (signal.metadata.get("score", 0.0), signal.timestamp),
+            reverse=True,
+        )
+        top = signals[:MAX_SIGNALS]
+        if top:
+            logger.info("EOD compression: %d actionable signal(s)", len(top))
+        return top
 
-        signals.sort(key=lambda s: s.metadata.get("score", 0.0), reverse=True)
-        return signals
-
-    # -- evaluation ---------------------------------------------------------
-    def _evaluate(
+    # -- signal construction ------------------------------------------------
+    def _build_signal(
         self,
         symbol: str,
-        timeframe: str,
-        df: pd.DataFrame,
-        daily: pd.DataFrame | None,
-        now: datetime,
+        candidate: _Candidate,
+        score: float,
+        detail: dict,
         move_date: str,
-    ) -> Signal | None:
-        box_bars = BOX_BARS[timeframe]
-        if len(df) < max(MIN_BARS[timeframe], box_bars + 5):
-            return None
-
-        last_close = float(df["close"].iloc[-1])
-        last_open = float(df["open"].iloc[-1])
-        if last_close <= 0:
-            return None
-
-        max_box_pct = MAX_BOX_RANGE_BY_TF.get(timeframe, MAX_BOX_RANGE_PCT)
-
-        # -- Bollinger bandwidth series (used across all 3 setup states) ----
-        bb = bollinger(df, BOLLINGER_PERIOD, BOLLINGER_NUM_STD)
-        bandwidth = bb["bandwidth"]
-        # Normalize bandwidth to a fraction of price if the indicator returns
-        # percent (e.g. 1.8 vs 0.018).
-        last_bw_raw = float(bandwidth.iloc[-1]) if not pd.isna(bandwidth.iloc[-1]) else 999.0
-        bw_scale = 0.01 if last_bw_raw > 0.25 else 1.0
-        bw_frac_series = bandwidth * bw_scale
-
-        median_width = (
-            bw_frac_series.rolling(
-                SQUEEZE_LOOKBACK[timeframe],
-                min_periods=min(SQUEEZE_MIN_PERIODS[timeframe], max(10, len(df) // 2)),
+        *,
+        dual_bar: bool,
+    ) -> Signal:
+        m = candidate.snapshot
+        if candidate.direction == "LONG":
+            entry = round(
+                m.last
+                if candidate.setup_type in {"BOX_IGNITION", "MIDLINE_RECLAIM"}
+                else candidate.box_high * (1.0 + ENTRY_BUFFER),
+                2,
             )
-            .median()
-            .iloc[-1]
+            raw_stop = candidate.box_low * (1.0 - STOP_BUFFER)
+            max_stop = entry * (1.0 - MIN_BTST_STOP_PCT)
+            stop = round(min(raw_stop, max_stop), 2)
+            risk_pts = max(entry - stop, entry * 0.01)
+            target_1 = round(entry + 2.5 * risk_pts, 2)
+            target_2 = round(entry + 4.5 * risk_pts, 2)
+            limit_price = round(entry * (1.0 + LIMIT_SLIPPAGE_CAP), 2)
+        else:
+            entry = round(m.last, 2)
+            raw_stop = candidate.box_high * (1.0 + STOP_BUFFER)
+            min_stop = entry * (1.0 + MIN_BTST_STOP_PCT)
+            stop = round(max(raw_stop, min_stop), 2)
+            risk_pts = max(stop - entry, entry * 0.01)
+            target_1 = round(entry - 2.5 * risk_pts, 2)
+            target_2 = round(entry - 4.5 * risk_pts, 2)
+            limit_price = round(entry * (1.0 - LIMIT_SLIPPAGE_CAP), 2)
+
+        risk_pct = round(risk_pts / entry * 100.0, 2) if entry > 0 else 0.0
+        daily_detail = detail.get("daily_detail", {})
+        par20 = m.par20_long if candidate.direction == "LONG" else m.par20_short
+        wick_ratio = (
+            m.wick_ratio_long if candidate.direction == "LONG" else m.wick_ratio_short
         )
-        if pd.isna(median_width) or median_width <= 0:
-            median_width = float(bw_frac_series.tail(30).median())
-        if pd.isna(median_width) or median_width <= 0:
-            return None
-
-        # ===================================================================
-        # DETECT WHICH OF THE 3 SETUP STATES APPLIES:
-        #   1. EOD_COIL: Last N bars are inside the tight box.
-        #   2. BOX_IGNITION: Prior N bars (shifted by 1 bar) were inside a
-        #      tight box, and the current bar just broke ABOVE that ceiling.
-        #   3. SPRING_RECLAIM: Prior box coiled, dipped slightly (<= 1.8%),
-        #      and the current green bar just flipped Supertrend / reclaimed.
-        # ===================================================================
-        setup_type = None
-        box = df.iloc[-box_bars:]
-        box_high = float(box["high"].max())
-        box_low = float(box["low"].min())
-        box_range = box_high - box_low
-        box_range_pct = box_range / last_close if box_range > 0 else 999.0
-        ref_bw = float(bw_frac_series.iloc[-1])
-        squeeze_ratio = ref_bw / float(median_width)
-
-        abs_bw_limit = ABS_SQUEEZE_MAX_BW.get(timeframe, 0.020)
-        is_squeezed_now = (squeeze_ratio <= SQUEEZE_MAX_RATIO) or (ref_bw <= abs_bw_limit)
-
-        if 0 < box_range_pct <= max_box_pct and is_squeezed_now:
-            setup_type = "EOD_COIL"
-        else:
-            # Check if the PRIOR box (1 bar ago) was tightly coiled and JUST ignited!
-            prior_box = df.iloc[-(box_bars + 1) : -1]
-            p_high = float(prior_box["high"].max())
-            p_low = float(prior_box["low"].min())
-            p_range = p_high - p_low
-            p_range_pct = p_range / last_close if p_range > 0 else 999.0
-            p_bw = float(bw_frac_series.iloc[-2]) if len(bw_frac_series) >= 2 else ref_bw
-            p_sq_ratio = p_bw / float(median_width)
-            was_squeezed_prior = (p_sq_ratio <= SQUEEZE_MAX_RATIO) or (p_bw <= abs_bw_limit)
-
-            if (
-                0 < p_range_pct <= max_box_pct
-                and was_squeezed_prior
-                and last_close > p_high
-                and last_close > last_open
-            ):
-                setup_type = "BOX_IGNITION"
-                box = prior_box
-                box_high, box_low = p_high, p_low
-                box_range, box_range_pct = p_range, p_range_pct
-                squeeze_ratio = p_sq_ratio
-            elif timeframe == "10m" and len(df) >= box_bars + 6:
-                # State 3: Morning Shakeout Spring (e.g. PATANJALI).
-                # The box 4 bars ago was coiled, price dipped <= 1.8% below it,
-                # and the current bar is a green reclaim above the box midline.
-                spring_box = df.iloc[-(box_bars + 4) : -4]
-                s_high = float(spring_box["high"].max())
-                s_low = float(spring_box["low"].min())
-                s_range = s_high - s_low
-                s_range_pct = s_range / last_close if s_range > 0 else 999.0
-                recent_dip_low = float(df["low"].iloc[-4:].min())
-                dip_depth_pct = (s_low - recent_dip_low) / s_low if s_low > 0 else 999.0
-
-                if (
-                    0 < s_range_pct <= max_box_pct
-                    and 0.0 <= dip_depth_pct <= 0.018
-                    and last_close >= (s_high + s_low) / 2.0
-                    and last_close > last_open
-                ):
-                    setup_type = "SPRING_RECLAIM"
-                    box = spring_box
-                    box_high = s_high
-                    box_low = min(s_low, recent_dip_low)
-                    box_range = box_high - box_low
-                    box_range_pct = s_range_pct
-
-        if setup_type is None or box_range <= 0:
-            return None
-
-        # -- score A: compression quality (fixes shrinking ATR_14 bug) ------
-        a_box = A_BOX_POINTS * _ramp(box_range_pct, max_box_pct, A_BOX_BEST_PCT)
-        a_squeeze = A_SQUEEZE_POINTS * _ramp(
-            min(squeeze_ratio, ref_bw / abs_bw_limit * 0.40),
-            SQUEEZE_MAX_RATIO,
-            A_SQUEEZE_BEST_RATIO,
-        )
-        # 50-bar baseline ATR + price % + body/range doji test, so prolonged
-        # pipes are still recognised as thin bars instead of self-penalising.
-        atr50_series = atr(df, min(50, len(df) - 2)).reindex(box.index)
-        bodies = (box["close"] - box["open"]).abs()
-        candle_ranges = (box["high"] - box["low"]).replace(0.0, float("nan"))
-        is_thin_atr = (bodies <= THIN_BODY_ATR * atr50_series) & atr50_series.notna()
-        is_thin_pct = (bodies / box["close"]) <= THIN_BODY_PRICE_PCT
-        is_doji_bar = (bodies / candle_ranges).fillna(0.0) <= THIN_DOJI_RATIO
-        thin = is_thin_atr | is_thin_pct | is_doji_bar
-        thin_density = float(thin.mean()) if len(thin) else 0.0
-        a_thin = A_THIN_POINTS * thin_density
-        score_a = a_box + a_squeeze + a_thin
-
-        # -- score B: absorption / accumulation evidence -------------------
-        last20 = df.iloc[-20:]
-        bar_mid = (last20["high"] + last20["low"]) / 2.0
-        up_bars = (last20["close"] >= last20["open"]) | (last20["close"] >= bar_mid)
-        up_volume = float(last20.loc[up_bars, "volume"].sum())
-        down_volume = float(last20.loc[~up_bars, "volume"].sum())
-        par20 = up_volume / down_volume if down_volume > 0 else 3.0
-        b_par = B_PAR_POINTS * _ramp(par20, PAR_WORST, PAR_BEST)
-
-        lower_wick = (box[["open", "close"]].min(axis=1) - box["low"]).mean()
-        upper_wick = (box["high"] - box[["open", "close"]].max(axis=1)).mean()
-        wick_ratio = float(lower_wick / upper_wick) if upper_wick > 0 else 3.0
-        b_wick = B_WICK_POINTS * _ramp(wick_ratio, WICK_WORST, WICK_BEST)
-
-        box_position = max(0.0, min(1.0, (last_close - box_low) / box_range))
-        b_pos = B_POS_POINTS * _ramp(box_position, POS_WORST, POS_BEST)
-        score_b = b_par + b_wick + b_pos
-
-        # -- score C: intraday timing (Zerodha RSI(9) + EMA3/SMA21 + ST) ---
-        rsi9_series = rsi(df, RSI9_PERIOD)
-        rsi9 = float(rsi9_series.iloc[-1])
-        rsi9_ema3_series = rsi9_series.ewm(span=3, adjust=False).mean()
-        rsi9_ema3 = float(rsi9_ema3_series.iloc[-1])
-        rsi9_ema3_prev = (
-            float(rsi9_ema3_series.iloc[-2]) if len(rsi9_ema3_series) >= 2 else rsi9_ema3
-        )
-        rsi9_sma21 = float(rsi9_series.rolling(21, min_periods=5).mean().iloc[-1])
-        if pd.isna(rsi9) or pd.isna(rsi9_sma21):
-            return None
-
-        c_rsi = C_RSI_POINTS * max(0.0, 1.0 - abs(rsi9 - RSI9_PEAK) / RSI9_SPAN)
-        if rsi9_ema3 >= rsi9_sma21:
-            c_cross = C_RSI_CROSS_POINTS
-        elif (rsi9_ema3 >= rsi9_sma21 - 3.5) and (rsi9_ema3 > rsi9_ema3_prev):
-            # Curling upward right inside the coil (SHOPERSTOP / TEAMLEASE / PATANJALI)
-            c_cross = C_RSI_CURL_POINTS
-        else:
-            c_cross = 0.0
-
-        st = supertrend(df, SUPERTREND_PERIOD, SUPERTREND_MULTIPLIER)
-        st_direction = float(st["direction"].iloc[-1])
-        st_value = float(st["supertrend"].iloc[-1]) if not pd.isna(st.iloc[-1, 0]) else 0.0
-        if st_direction == 1.0:
-            c_st = C_ST_POINTS
-        elif st_value > 0 and abs(last_close - st_value) / last_close <= ST_NEAR_PCT:
-            c_st = C_ST_NEAR_POINTS
-        else:
-            c_st = 0.0
-
-        typical = (df["high"] + df["low"] + df["close"]) / 3.0
-        vwap_series = (typical * df["volume"]).rolling(VWAP_BARS).sum() / df[
-            "volume"
-        ].rolling(VWAP_BARS).sum().replace(0.0, float("nan"))
-        vwap = float(vwap_series.iloc[-1]) if not pd.isna(vwap_series.iloc[-1]) else 0.0
-        above_vwap = bool(vwap and last_close >= vwap * 0.998)
-        c_vwap = C_VWAP_POINTS if above_vwap else 0.0
-
-        # Live-ignition bonus: the breakout bar carries >= 1.5x the prior
-        # 20-bar average volume (Turtle-style confirmation).
-        vol_sma20 = float(df["volume"].iloc[-21:-1].mean()) if len(df) >= 21 else 0.0
-        vol_mult = float(df["volume"].iloc[-1] / vol_sma20) if vol_sma20 > 0 else 1.0
-        ignition_bonus = (
-            IGNITION_VOL_BONUS
-            if (setup_type in ("BOX_IGNITION", "SPRING_RECLAIM") and vol_mult >= 1.5)
-            else 0.0
-        )
-
-        score_c = min(C_MAX_POINTS, c_rsi + c_cross + c_st + c_vwap + ignition_bonus)
-
-        # -- score D: daily context ----------------------------------------
-        daily_points, daily_detail = 0.0, {}
-        if daily is not None:
-            daily_points, daily_detail = _daily_scores(daily, last_close)
-        score_d = daily_points
-
-        score = min(100.0, round(score_a + score_b + score_c + score_d, 1))
-        if score >= BAND_BUY_MIN:
-            band = BAND_BUY
-        elif score >= BAND_HOLD_MIN:
-            band = BAND_HOLD
-        else:
-            band = BAND_SKIP
-
-        # -- actionable levels (with shakeout-proof stop & targets) ---------
-        if setup_type == "BOX_IGNITION":
-            entry = round(last_close, 2)
-        else:
-            entry = round(box_high * (1.0 + ENTRY_BUFFER), 2)
-
-        stop_ref = box_low
-        if st_direction == 1.0 and box_low <= st_value <= last_close:
-            stop_ref = max(box_low, st_value)
-
-        # Ensure the stop has at least MIN_BTST_STOP_PCT breathing room so a
-        # morning stop-hunt inside the box doesn't exit a valid BTST coil.
-        raw_stop = stop_ref * (1.0 - STOP_BUFFER)
-        max_allowed_stop = entry * (1.0 - MIN_BTST_STOP_PCT)
-        stop = round(min(raw_stop, max_allowed_stop), 2)
-
-        risk_pts = max(entry - stop, entry * 0.01)
-        risk_pct = round((entry - stop) / entry * 100.0, 2) if entry > 0 else 0.0
-        target_1 = round(entry + 2.5 * risk_pts, 2)
-        target_2 = round(entry + 4.5 * risk_pts, 2)
 
         return Signal(
             symbol=symbol,
             strategy_name=self.metadata.name,
-            timestamp=now,
-            price=last_close,
+            timestamp=m.timestamp,
+            price=m.last,
             metadata={
-                "timeframe": timeframe,
-                "setup_type": setup_type,
+                "timeframe": "10m",
+                "direction": candidate.direction,
+                "setup_type": candidate.setup_type,
                 "score": score,
-                "band": band,
-                "score_compression": round(score_a, 1),
-                "score_absorption": round(score_b, 1),
-                "score_timing": round(score_c, 1),
-                "score_daily": round(score_d, 1),
+                "band": BAND_BUY,
+                "score_compression": detail["compression"],
+                "score_trigger": detail["trigger"],
+                "score_participation": detail["participation"],
+                "score_daily": detail["daily"],
+                "score_bonus": 0.0,
                 "entry": entry,
+                "trigger_price": entry,
+                "limit_price": limit_price,
                 "stop": stop,
                 "target_1": target_1,
                 "target_2": target_2,
+                "pilot_qty_pct": 40,
+                "breakout_qty_pct": 60,
                 "risk_pct": risk_pct,
-                "box_range_pct": round(box_range_pct * 100.0, 2),
-                "box_position_pct": round(box_position * 100.0, 1),
-                "thin_density_pct": round(thin_density * 100.0, 0),
-                "squeeze_ratio": round(squeeze_ratio, 2),
-                "vol_mult": round(vol_mult, 2),
+                "box_range_pct": round(candidate.box_range_pct * 100.0, 2),
+                "box_position_pct": round(candidate.box_position * 100.0, 1),
+                "thin_density_pct": round(candidate.thin_density * 100.0, 0),
+                "squeeze_ratio": round(candidate.squeeze, 2),
+                "nozzle_ratio": round(candidate.nozzle, 2),
+                "mid": round(m.mid, 2),
+                "mid_dist_pct": round((m.last - m.mid) / m.mid * 100.0, 2)
+                if m.mid
+                else 0.0,
+                "pct_b": round(m.pct_b, 2),
+                "bandwidth_pct": round(m.bandwidth * 100.0, 2),
+                "rsi9": round(m.rsi, 1),
+                "rsi9_ema3": round(m.rsi_ema3, 1),
+                "rsi9_sma21": round(m.rsi_sma21, 1),
+                "rsi9_above_slow": bool(m.rsi_ema3 >= m.rsi_sma21),
+                "gmma_fast_mean": round(m.fast_mean, 2),
+                "gmma_slow_mean": round(m.slow_mean, 2),
+                "gmma_fast_above_slow": bool(m.fast_mean >= m.slow_mean),
+                "gmma_total_spread_pct": round(m.total_spread * 100.0, 2),
+                "gmma_slow_slope_pct": round(m.slow_slope * 100.0, 2),
+                "day_open": round(m.day_open, 2),
+                "day_high": round(m.day_high, 2),
+                "day_low": round(m.day_low, 2),
+                "day_impulse_pct": round(m.day_impulse * 100.0, 2),
+                "day_high_dist_pct": round(m.day_high_dist * 100.0, 2),
+                "day_low_dist_pct": round(m.day_low_dist * 100.0, 2),
+                "vol_mult": round(m.vol_ratio, 2),
                 "par20": round(par20, 2),
                 "wick_ratio": round(wick_ratio, 2),
-                "rsi9": round(rsi9, 1),
-                "rsi9_above_slow": bool(rsi9_ema3 >= rsi9_sma21),
-                "supertrend_dir": int(st_direction),
-                "supertrend": round(st_value, 2),
-                "above_vwap": above_vwap,
-                "daily_data": daily is not None,
+                "daily_data": bool(daily_detail),
                 **daily_detail,
-                "compression_bars": box_bars,
+                "compression_bars": BOX_BARS,
+                "trigger_bar": candidate.trigger_bar,
+                "dual_bar": dual_bar,
+                "candle_time": m.timestamp.isoformat(),
                 "expected_move_date": move_date,
             },
         )

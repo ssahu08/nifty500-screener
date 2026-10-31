@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS runs (
     run_at TEXT NOT NULL,
     symbol TEXT NOT NULL,
     signal_time TEXT NOT NULL,
+    direction TEXT NOT NULL DEFAULT '',
     price REAL NOT NULL,
     metadata TEXT DEFAULT '{}'
 );
@@ -53,15 +54,38 @@ class SignalStore:
     def _init_db(self) -> None:
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            # Migration: older databases have no direction column. Add it and
+            # backfill from the signal metadata so LONG and SHORT signals on
+            # the same candle remain distinct occurrences.
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)")}
+            if "direction" not in columns:
+                conn.execute(
+                    "ALTER TABLE runs ADD COLUMN direction TEXT NOT NULL DEFAULT ''"
+                )
+                for row in conn.execute("SELECT id, metadata FROM runs").fetchall():
+                    try:
+                        direction = str(
+                            json.loads(row["metadata"] or "{}").get("direction", "")
+                        )
+                    except (json.JSONDecodeError, TypeError):
+                        direction = ""
+                    if direction:
+                        conn.execute(
+                            "UPDATE runs SET direction = ? WHERE id = ?",
+                            (direction, row["id"]),
+                        )
+
             # One row per occurrence: dedupe any pre-existing repeats, then
             # enforce it (a candle may be re-evaluated by a later run).
+            conn.execute("DROP INDEX IF EXISTS idx_runs_unique")
             conn.execute(
                 "DELETE FROM runs WHERE id NOT IN "
-                "(SELECT MIN(id) FROM runs GROUP BY strategy_name, symbol, signal_time)"
+                "(SELECT MIN(id) FROM runs GROUP BY "
+                "strategy_name, symbol, signal_time, direction)"
             )
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_unique "
-                "ON runs(strategy_name, symbol, signal_time)"
+                "ON runs(strategy_name, symbol, signal_time, direction)"
             )
 
     def save_run(self, strategy_name: str, signals: list[Signal]) -> list[Signal]:
@@ -77,15 +101,17 @@ class SignalStore:
         now = datetime.now(IST).isoformat()
         with self._connect() as conn:
             seen = {
-                (row["symbol"], row["signal_time"]): row["id"]
+                (row["symbol"], row["signal_time"], row["direction"]): row["id"]
                 for row in conn.execute(
-                    "SELECT id, symbol, signal_time FROM runs WHERE strategy_name = ?",
+                    "SELECT id, symbol, signal_time, direction FROM runs "
+                    "WHERE strategy_name = ?",
                     (strategy_name,),
                 )
             }
             fresh = []
             for s in signals:
-                key = (s.symbol, s.timestamp.isoformat())
+                direction = str((s.metadata or {}).get("direction", ""))
+                key = (s.symbol, s.timestamp.isoformat(), direction)
                 if key in seen:
                     # Re-evaluating the same candle refreshes its live price and
                     # metadata (e.g. volume rank, move) but must not re-alert.
@@ -105,14 +131,15 @@ class SignalStore:
             if fresh:
                 conn.executemany(
                     "INSERT OR IGNORE INTO runs "
-                    "(strategy_name, run_at, symbol, signal_time, price, metadata) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "(strategy_name, run_at, symbol, signal_time, direction, "
+                    "price, metadata) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     [
                         (
                             strategy_name,
                             now,
                             s.symbol,
                             s.timestamp.isoformat(),
+                            str((s.metadata or {}).get("direction", "")),
                             s.price,
                             json.dumps(s.metadata, default=str),
                         )

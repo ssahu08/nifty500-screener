@@ -482,33 +482,46 @@ function signalsTable(signals, name) {
 
 function historyTable(signals) {
   if (!signals.length) {
-    return '<div class="card-table"><div class="empty">No signals in the last 14 days.</div></div>';
+    return '<div class="card-table"><div class="empty">No BUY-band signals in the last 14 days.</div></div>';
   }
+  const hasDirection = signals.some((s) => (s.metadata || {}).direction);
+  const hasSetup = signals.some((s) => (s.metadata || {}).setup_type);
   const rows = signals
-    .map(
-      (s) => `<tr>
+    .map((s) => {
+      const meta = s.metadata || {};
+      return `<tr>
         <td>${escapeHtml(fmtTime(s.run_at))}</td>
         <td>${escapeHtml(s.symbol)}</td>
+        ${hasDirection ? `<td>${dirPill(meta)}</td>` : ""}
+        ${hasSetup ? `<td>${escapeHtml(meta.setup_type || "—")}</td>` : ""}
         <td><a href="${chartUrl(s.symbol)}" target="_blank" rel="noopener noreferrer" class="chart-btn">Chart</a></td>
         <td>${escapeHtml(fmtTime(s.signal_time))}</td>
         <td>${fmtPrice(s.price)}</td>
-      </tr>`
-    )
+      </tr>`;
+    })
     .join("");
+  const directionHead = hasDirection ? "<th>Direction</th>" : "";
+  const setupHead = hasSetup ? "<th>Setup</th>" : "";
   return `<div class="card-table"><table class="grid">
-    <thead><tr><th>Run at</th><th>Symbol</th><th>Chart</th><th>Signal time</th><th>Price (₹)</th></tr></thead>
+    <thead><tr><th>Run at</th><th>Symbol</th>${directionHead}${setupHead}<th>Chart</th><th>Signal time</th><th>Price (₹)</th></tr></thead>
     <tbody>${rows}</tbody>
   </table></div>`;
 }
 
 function strategyCard(strategy) {
   const allSignals = state.results.get(strategy.name) || [];
+  // Banded strategies are actionable-only: never surface stale HOLD/SKIP
+  // rows left in history by an older strategy version.
+  const banded = allSignals.some((s) => (s.metadata || {}).band);
+  const visibleSignals = banded
+    ? allSignals.filter((s) => (s.metadata || {}).band === "BUY")
+    : allSignals;
   const activeSubtab = state.subtabs.get(strategy.name) || "all";
   // Filter signals by subtab variant
   const signals =
     activeSubtab === "all"
-      ? allSignals
-      : allSignals.filter((s) => (s.metadata || {}).variant === activeSubtab);
+      ? visibleSignals
+      : visibleSignals.filter((s) => (s.metadata || {}).variant === activeSubtab);
   const count = signals.length;
   const lastRun = allSignals.length ? fmtTime(allSignals[0].run_at) : "never run";
   const sched =
@@ -1096,7 +1109,11 @@ async function toggleHistory(name, btn, card) {
   btn.textContent = "Loading…";
   try {
     const data = await getJson(`/api/history/${encodeURIComponent(name)}?days=14`);
-    block.innerHTML = `<h4>Signals · last 14 days</h4>${historyTable(data.signals)}`;
+    const banded = data.signals.some((s) => (s.metadata || {}).band);
+    const rows = banded
+      ? data.signals.filter((s) => (s.metadata || {}).band === "BUY")
+      : data.signals;
+    block.innerHTML = `<h4>Signals · last 14 days</h4>${historyTable(rows)}`;
     block.classList.remove("hidden");
     btn.textContent = "Hide history";
   } catch (err) {

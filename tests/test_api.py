@@ -87,7 +87,7 @@ def test_list_strategies(client) -> None:
             "timeframes",
         }
     eod = next(s for s in res.json() if s["name"] == "EOD Compression Breakout")
-    assert eod["run_at"] == "15:20"
+    assert eod["run_at"] == "15:35"
 
 
 def test_run_unknown_strategy_404(client) -> None:

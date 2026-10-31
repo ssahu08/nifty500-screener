@@ -1,7 +1,12 @@
 """Strategy 6: EOD Guppy Ribbon + Bollinger Compression Breakout & Breakdown - v3.2.
 
-Added as a *new* strategy alongside the existing v3 "EOD Compression Breakout"
-(``app/strategies/compression.py``), which stays unchanged. This module adds
+**Legacy / manual only.** The unified ``app/strategies/compression.py`` now
+combines the 21-period Bollinger mid-line, the 12-EMA Guppy ribbon and RSI(9),
+so this module is kept for ad-hoc research runs and no longer scheduled
+automatically (``schedule_type="manual"``, ``run_at=None``) to avoid duplicate
+EOD alerts.
+
+Originally added alongside the v3 "EOD Compression Breakout". This module adds
 full 12-EMA Guppy Multiple Moving Average (GMMA) ribbon geometry, adaptive
 multi-window afternoon box detection (15-bar and 10-bar), dual-path Bollinger
 bandwidth gates, and bidirectional (LONG & SHORT) institutional setup
@@ -332,9 +337,9 @@ class GuppyCompressionStrategy(Strategy):
             ),
             category=Category.INTRADAY,
             universe="NIFTY_500",
-            schedule_type="auto",
+            schedule_type="manual",
             timeframes=["10m", "daily"],
-            run_at="15:20",
+            run_at=None,
             candle_interval="10m",
         )
 

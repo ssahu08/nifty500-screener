@@ -20,7 +20,7 @@ terminal and make the final decision yourself.
 | 5 | Telegram alerts | done |
 | 6 | API endpoints | done |
 | 7 | Dashboard UI: Market Overview + strategy results | done |
-| 8 | Remaining strategies, one at a time | in progress (EOD Compression Breakout v3, Guppy Ribbon v3.2 done) |
+| 8 | Remaining strategies, one at a time | in progress (unified EOD Compression Breakout v4 done; Guppy legacy/manual) |
 | 9 | Hardening: error handling, logging, rate limits, final README | pending |
 
 Strategy logic is **not** invented here. Each strategy is implemented from a
@@ -180,65 +180,73 @@ only evaluated on the last trading day of the week/month; bearish **gravestone**
 Dojis are shown and labelled rather than excluded; the **subtype** and confluence
 score are included as extra metadata beyond FR-9's three fields.
 
-### Second strategy: EOD Compression Breakout (Phase 8)
+### Second strategy: EOD Compression Breakout (Phase 8, unified v4)
 
 `app.strategies.compression.EodCompressionBreakoutStrategy` (universe **Nifty 500**,
-auto, daily at **15:20 IST**, timeframes 10-min + 1-hour + daily context).
-Implements the supplied "Day-Before Explosion" spec, redesigned (v2) after the
-original all-or-nothing gate stack measured poorly against 41 explosive (+8%)
-days in a 20-session replay - it fired on none of them:
+auto, daily at **15:35 IST**, timeframes 10-min + daily context). This is the
+single EOD strategy: the former Guppy module is now manual/legacy, so there is
+one 15:35 alert stream instead of duplicate 15:20 and 15:35 runs.
 
-* Runs at 3:20 PM once the final continuous candle (15:05-15:15) has closed,
-  leaving ~10 minutes to place
-  an order before the 3:30 close.
-* **Two-stage scan (FR-13 style)**: one batched quote pass keeps only symbols
-  whose day range is <= 3% (missing quotes are kept); only candidates get real
-  10-minute and daily candles (daily = 360 days, only for prefilter survivors).
-* **Two hard gates** - the compression must exist: a tight box (last 15 x 10-min
-  bars, or 3 x 1-hour bars, spanning <= 2% of price) with contracting Bollinger
-  bandwidth (<= 0.45x its ~10-session median).
-* **0-100 confidence score** ranks every gate passer:
-  compression quality (24: box tightness, squeeze depth, thin-bar density),
-  absorption/accumulation evidence (26: up/down volume ratio PAR-20, lower-vs-upper
-  wick asymmetry, close position in the box), intraday timing (26: RSI(9) in the
-  50s with EMA3 >= SMA21, Supertrend(10,3), rolling 25-bar VWAP), daily context
-  (24: close > EMA20 > EMA50, 52-week-high proximity, tight daily base length,
-  turnover liquidity).
-* **Bands**: BUY (score >= 70), HOLD (45-69), SKIP (< 45). Every gate passer is
-  emitted (ranked by score on the dashboard); Telegram alerts only BUY-band rows
-  and stays silent when a banded run has none. Signal metadata carries the score
-  breakdown, band, entry/stop (box edges, Supertrend-aware stop) and every
-  component measurement plus `expected_move_date` (next trading day).
-* The 1-hour timeframe is resampled from 10-minute candles in memory (no extra
-  API calls, per the BRD). Indicators (`supertrend`, `bollinger`, `rsi`, `atr`)
-  live in `app.strategies.indicators` and are unit-tested.
+The original all-or-nothing gate stack measured poorly (fired on none of 41
+explosive days), so the strategy was rebuilt as a compressed-coil detector with
+a quality score. v4 combines three indicators into one decision:
 
-### Guppy Ribbon Compression (v3.2, added alongside v3)
+* **21-period Bollinger mid-line** (`BOLLINGER_PERIOD=21`, `STD=2.0`) is the
+  reference/trigger line. A setup is only valid when price is at or above the
+  mid (LONG) or at/below it (SHORT).
+* **12-EMA Guppy ribbon** - fast `3,5,8,10,12,15`, slow `30,35,40,45,50,60`.
+  Ribbon geometry (fast-above-slow, slow-ribbon slope, total spread) confirms
+  trend alignment; a tight ribbon pinch contributes to compression quality.
+* **RSI(9)** with EMA(3) vs SMA(21) confirmation. Cross/curl direction and the
+  RSI level (not overbought/oversold for the direction) are scored.
 
-`app.strategies.guppy_compression.GuppyCompressionStrategy` (universe **Nifty 500**,
-auto, daily at **15:20 IST**, 10-min + 1-hour + daily context). This is a
-**separate strategy**: the v3 EOD Compression Breakout above is untouched.
-It adds full 12-EMA Guppy Multiple Moving Average (GMMA) ribbon geometry
-(fast red EMAs 3/5/8/10/12/15, slow blue EMAs 30/35/40/45/50/60), adaptive
-15-bar / 10-bar afternoon box selection, and bidirectional classification:
+**Dual EOD bar.** The 15:05 continuous bar (15:05-15:15) is the primary trigger
+for flat coils, staircase coils and box ignitions. The 15:25 auction bar is
+used only when it is fully closed (scan at 15:35) for midline reclaims,
+staircase reclaims and short breakdowns where the 15:05 bar was still below the
+mid. The flat 15:15 auction-window bar is always skipped.
 
-* **LONG**: `STAIRCASE_COIL` (>= 1.2% morning impulse step, then a flat pipe
-  resting on a rising slow ribbon), `EOD_COIL` (flat coil without the step),
-  `BOX_IGNITION` (live close above a prior coiled box on >= 1.5x volume), and
-  `SPRING_RECLAIM` (morning shakeout dip reclaimed with a green bar).
-* **SHORT**: `SHORT_DIST_COIL` (coil trapped under a falling slow ribbon) and
-  `SHORT_BREAKDOWN` (live high-volume break below a distribution shelf).
-* **GMMA scoring**: ribbon pinch in compression (26-pt A block) and
-  fast-above-slow / price-above-slow structure in the absorption block (24-pt B
-  block, 10 pts of GMMA structure). RSI(9) is scored on a plateau (LONG
-  [39..64], SHORT [34..54]) with EMA(3)-vs-SMA(21) cross/curl detection.
-* **Execution metadata**: `direction`, `entry`/`trigger_price`, `limit_price`
-  (+/- 1% slippage cap for 09:15 SL-L orders), `stop` (structural box/slow-ribbon
-  plus >= 1.2% shakeout buffer), `target_1` (2.5R), `target_2` (4.5R),
-  `pilot_qty_pct` (40) / `breakout_qty_pct` (60), and all GMMA/RSI/score
-  components. Both timeframes are deduplicated per symbol with a tracked
-  `score_bonus` (+5 MTF confluence), so score components still add up to the
-  total.
+**Five archetypes, all with explicit false-positive gates:**
+
+* `STAIRCASE_COIL` (LONG) - morning impulse (>= ~1.2%) then a flat afternoon
+  pipe resting on a rising slow ribbon.
+* `FLAT_COIL` (LONG) - full-afternoon box (`box <= 1.0%`, `squeeze <= 0.50`,
+  nozzle <= 0.35) above the 21-MA mid with a rising RSI/ribbon.
+* `BOX_IGNITION` (LONG) - live close above a prior coiled box on >= 1.5x
+  volume, with the prior box/nozzle compression gates.
+* `MIDLINE_RECLAIM` (LONG) - prior bar below the 21-MA mid, current bar
+  reclaiming it with a green close and a tight box.
+* `SHORT_BREAKDOWN` (SHORT) - high-volume break below a distribution shelf,
+  price below the mid, ribbon/RSI rolling over.
+
+There is **no absolute-bandwidth free pass** (`ABS_SQUEEZE_MAX_BW` was deleted):
+every signal must pass the relative squeeze/nozzle gates and reach the score
+cutoff. The 1-hour path was removed because the dual-bar logic is 10-minute
+specific.
+
+**Scoring and emission.** The 0-100 score is compression-heavy:
+setup/trigger quality (STAIRCASE 19, FLAT 15, IGNITION 15, MIDLINE_RECLAIM 20,
+SHORT_BREAKDOWN 21), RSI/Guppy confirmation, participation (volume expansion,
+PAR-20, wick asymmetry), and daily context (close vs EMA20/EMA50, 52-week-high
+proximity, tight base, turnover). Only `band == "BUY"` rows at or above
+`BAND_BUY_MIN=72` are emitted - HOLD/SKIP are never stored or shown - sorted by
+score and capped at the top 15. If any SHORT candidate exists for a symbol, all
+LONG candidates for that symbol are suppressed (one direction per symbol).
+Signals are stamped with the **closed candle timestamp** (15:05 or 15:25), not
+the scan time, and carry `direction`, `setup_type`, `trigger_bar`, `dual_bar`,
+entry/limit/stop/targets and the full score breakdown.
+
+**Two-stage scan (FR-13 style).** One batched quote pass keeps only symbols
+whose day range is <= 3% (missing quotes are kept); only survivors get real
+10-minute and daily candles (daily = 365 days, only for prefilter survivors).
+
+### Guppy Ribbon Compression (v3.2, now manual/legacy)
+
+`app.strategies.guppy_compression.GuppyCompressionStrategy` remains registered
+for ad-hoc research but is **manual only** (`schedule_type="manual"`,
+`run_at=None`). Its 12-EMA ribbon, box selection and LONG/SHORT classification
+were folded into the unified `compression.py` above, so running it on a schedule
+would duplicate the 15:35 alerts.
 
 ### Open-Equals-Low
 

@@ -19,7 +19,7 @@ Key user rules interpreted and implemented:
 2. **Rank high-volume/high-quality at top**, low-quality at bottom.
 3. **Compare 09:15 first 10-minute bar to the SAME bar over previous 10 sessions** — avoids time-of-day seasonality that would make an opening bar look weak vs a 14:00 bar.
 4. **Volume column must be visible** so the signal day's volume is visibly compared with recent days.
-5. **Keep `v3 app/strategies/compression.py` untouched**; v3.2 Guppy strategy stays separate (`guppy_compression.py`).
+5. **Keep `v3 app/strategies/compression.py` untouched**; v3.2 Guppy strategy stays separate (`guppy_compression.py`). *(Superseded 2026-10-31: the two were merged into one unified v4 `compression.py`; see section 8.)*
 6. **No duplicate `app/core/fyers_auth.py`**; single token manager is `app/data/fyers.py::FyersAuthenticator`.
 7. **Dashboard PIN protects public dashboard**; credentials only in `.env`.
 8. **No service worker in the PWA**.
@@ -218,6 +218,97 @@ Since `git init` has not been executed, all files are untracked. The user explic
 - [x] DB (`data/screener.db`) updated with 8 new daily signals (`run_at = 2026-10-30T22:57:52+05:30`).
 - [x] `.env` exists (not committed); `.env` must be in `.gitignore` before push.
 - [x] No `.git` repository yet; `git init` required before push.
+
+---
+
+## 8. Unified EOD Strategy Redesign (v4) — 2026-10-31
+
+### 8.1 What changed
+
+The separate v3 compression strategy and v3.2 Guppy strategy were merged into
+one strategy in `app/strategies/compression.py`. `guppy_compression.py` is kept
+as **manual/legacy** (`schedule_type="manual"`, `run_at=None`) for research only.
+
+One indicator stack now drives every decision:
+
+| Component | Setting |
+|-----------|---------|
+| Bollinger mid-line (reference/trigger) | period 21, 2.0 std |
+| Guppy fast EMAs | 3, 5, 8, 10, 12, 15 |
+| Guppy slow EMAs | 30, 35, 40, 45, 50, 60 |
+| RSI | 9-period, EMA(3) vs SMA(21) confirmation |
+| Box | last 15 x 10-min bars |
+| Emission | 10-minute only (1-hour path removed) |
+| Schedule | daily 15:35 IST (dual-bar: 15:05 + 15:25) |
+| BUY cutoff | `BAND_BUY_MIN = 72.0` |
+| Output | BUY-band only, score-sorted, top 15 |
+
+**Dual-bar logic.** 15:05 is the trigger for `STAIRCASE_COIL`, `FLAT_COIL` and
+`BOX_IGNITION`. 15:25 (only visible once closed at 15:35) is the trigger for
+`MIDLINE_RECLAIM`, staircase reclaims, and `SHORT_BREAKDOWN` where the 15:05 bar
+was still below the mid. The flat 15:15 auction-window bar is skipped.
+
+**Deleted loopholes.** `ABS_SQUEEZE_MAX_BW` (absolute-bandwidth free pass) and
+`hourly_from_10m` were removed. Every signal must pass relative squeeze/nozzle
+gates and reach the BUY score cutoff. Signals are stamped with the closed candle
+timestamp, not `datetime.now(IST)`.
+
+**Direction handling.** `_scan` collects all matching archetypes, scores them,
+keeps the best per symbol, suppresses all LONG candidates when a SHORT candidate
+exists, and caps the result at 15. Storage gained a `direction` column with a
+migration/backfill from metadata and a direction-aware unique index so LONG and
+SHORT on the same candle remain distinct.
+
+**Dashboard.** Latest and history views filter banded strategies to `band ==
+"BUY"`; history shows explicit Direction and Setup columns with a direction
+pill. This prevents stale HOLD/SKIP rows from an older version from appearing.
+
+### 8.2 Gate tightening from replay
+
+The first unified pass produced false positives. Fixes:
+
+* Flat coil box tightened to `box <= 1.0%` and `squeeze <= 0.50`
+  (rejects KOTAKBANK 30/10 and similar).
+* Ignition nozzle tightened to `IGNITION_NOZZLE_MAX = 0.30`.
+* 15:05 candidate priority is staircase -> flat coil -> box ignition; a stock
+  already in a tight coil is reported as the coil, not a same-bar ignition
+  (fixed MARICO 30/10 being mislabelled `BOX_IGNITION`).
+* Weak ribbon tier = 3.0 points and weak RSI-cross tier = 2.0 points.
+* Short daily context rewards breakdowns near the 52-week high
+  (`_ramp(dist_52w, 0.20, 0.02)`) instead of already-extended stocks.
+
+### 8.3 Replay validation (Fyers 10m + daily)
+
+All cases below pass with `_scan(data, settings, 15:35)`:
+
+| Symbol | Date | Result | Setup | Score | Trigger |
+|--------|------|--------|-------|-------|---------|
+| WIPRO | 2026-02-24 | LONG | MIDLINE_RECLAIM | 72.7 | 15:25 |
+| HCLTECH | 2026-07-02 | LONG | STAIRCASE_COIL | 73.0 | 15:25 |
+| TCS | 2026-07-27 | LONG | STAIRCASE_COIL | 75.1 | 15:25 |
+| TCS | 2026-07-28 | rejected (gap follow-through, not required) | - | - | - |
+| MARICO | 2026-10-30 | LONG | FLAT_COIL | 81.0 | 15:05 |
+| SBIN | 2026-10-16 | LONG | FLAT_COIL | 81.8 | 15:05 |
+| ZYDUSLIFE | 2026-09-25 | LONG | STAIRCASE_COIL | 80.7 | 15:05 |
+| ZYDUSLIFE | 2026-09-29 | SHORT | SHORT_BREAKDOWN | 74.5 | 15:25 |
+| IPCALAB, CLEANMAX, HBLENGINE, JSWCEMENT, ICICIGI, SHYAMMETL, KOTAKBANK | 2026-10-30 | rejected | - | - | - |
+
+Note: an earlier ZYDUSLIFE 29/09 SHORT score of 77.2 came from a
+`score_probe.py` bug (`rets >= -0.022` for SHORT); the corrected strategy score
+is 74.5.
+
+### 8.4 Tests and files
+
+* `tests/test_compression.py` rewritten (22 tests): BUY-only end-to-end, candle
+  timestamps, dual-bar behavior, top-15 cap, score cutoff, archetype gates,
+  daily context, prefilter, and absence of the removed loopholes.
+* `tests/test_storage.py`: LONG/SHORT same-candle distinction and legacy DB
+  migration.
+* `tests/test_guppy_compression.py`: Guppy is manual/legacy.
+* `tests/test_api.py`: expects `run_at == "15:35"`.
+* Full suite: **266 passed, 1 warning**; `ruff check app tests` clean.
+* `app/static/app.js`: BUY-band filtering and history Direction/Setup columns.
+* `app/scheduler/jobs.py`: docstring updated to 15:35.
 
 ---
 
