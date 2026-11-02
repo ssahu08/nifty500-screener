@@ -5,6 +5,7 @@ from __future__ import annotations
 import pandas as pd
 
 from app.config import Settings
+from app.data.provider import Quote
 from app.strategies.base import Category
 from app.strategies.oel import OpenEqualsLowStrategy
 
@@ -448,3 +449,39 @@ def test_daily_quality_falls_back_to_daily_volume_without_10m() -> None:
     assert meta["open_vol_ratio"] is None
     assert meta["daily_vol_ratio"] == 1.0
     assert meta["score"] > 0
+
+
+# -- quote prefilter ---------------------------------------------------------
+def test_prefilter_keeps_only_open_equals_low(monkeypatch) -> None:
+    """Only OEL candidates get candle history; missing quotes are kept."""
+    s = OpenEqualsLowStrategy()
+    monkeypatch.setattr(
+        s, "get_universe", lambda settings: ["AAA", "BBB", "CCC", "DDD"]
+    )
+    quotes = {
+        "NSE:AAA-EQ": Quote(
+            "NSE:AAA-EQ", ltp=101.0, open=100.0, high=105.0, low=100.0
+        ),
+        "NSE:BBB-EQ": Quote(
+            "NSE:BBB-EQ", ltp=101.0, open=100.0, high=105.0, low=99.5
+        ),
+        # CCC has no quote -> kept so a data hiccup cannot hide a signal.
+        "NSE:DDD-EQ": Quote(
+            "NSE:DDD-EQ", ltp=101.0, open=100.0, high=105.0, low=None
+        ),
+    }
+    assert s.prefilter(quotes, _settings()) == ["AAA", "CCC", "DDD"]
+
+
+def test_prefilter_returns_empty_when_no_open_equals_low(monkeypatch) -> None:
+    s = OpenEqualsLowStrategy()
+    monkeypatch.setattr(s, "get_universe", lambda settings: ["AAA", "BBB"])
+    quotes = {
+        "NSE:AAA-EQ": Quote(
+            "NSE:AAA-EQ", ltp=101.0, open=100.0, high=105.0, low=99.0
+        ),
+        "NSE:BBB-EQ": Quote(
+            "NSE:BBB-EQ", ltp=101.0, open=100.0, high=105.0, low=98.0
+        ),
+    }
+    assert s.prefilter(quotes, _settings()) == []

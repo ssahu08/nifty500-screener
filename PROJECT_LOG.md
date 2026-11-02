@@ -312,4 +312,44 @@ is 74.5.
 
 ---
 
+## 9. 2026-11-02: OEL scan duration and scheduler blocking
+
+**Symptom**: an Open-Equals-Low manual run was still fetching at 385/501
+symbols after 23 minutes; a 10-minute Multi-Timeframe Doji auto run was also
+in progress. Both fetched 10-minute + daily candles for the full Nifty 500.
+
+**Root causes**
+1. OEL had no quote prefilter, so every run cost ~1,000 Fyers history requests.
+   At the internal safety limit of 40 requests/minute that is ~25 minutes.
+2. `StrategyScheduler.tick()` called `_run_auto_due([name])` sequentially, so
+   the slow Doji run held the tick and kept OEL idle until it finished.
+
+**Fixes**
+* `app/strategies/oel.py`: `prefilter()` keeps symbols whose batched quote has
+  `open == low` at 2-decimal precision, plus symbols with a missing/incomplete
+  quote. This is the exact live 10-minute gate (the quote's day low is the
+  minimum of today's bars) and, after the close, the exact daily-candle gate.
+  Matches are never filtered from the result; ranking is unchanged.
+* `app/scheduler/jobs.py`: `tick()` dispatches each due strategy to its own
+  daemon thread. `_claim`/`_release` prevent overlapping runs of the same
+  strategy, `_last_run` is stamped on completion, and a manual trigger while
+  the same strategy is running returns 0 instead of starting a duplicate.
+* `app/data/cache.py`: cache writes are serialised and atomic
+  (temp file + `os.replace`), so concurrent runs cannot read a half-written
+  JSON cache file.
+
+**Verified** (server restarted, market open)
+* Manual OEL: **6.4 s**, prefilter kept 75/501 symbols, no errors.
+* OEL triggered while a manual Doji run was fetching: OEL finished in
+  **82.7 s** while Doji was still scanning, proving the tick no longer blocks.
+* Full suite: **271 passed, 1 warning**; `ruff check app tests` clean.
+
+Note: during market hours the daily variant's "last completed candle" is the
+previous session. The quote prefilter is based on today's live day, so stale
+previous-session daily signals are not re-emitted by the 10-minute cadence.
+After the close (manual EOD run) the quote is the completed daily bar, so the
+daily list is reproduced exactly.
+
+---
+
 *This document is intended to provide an independent AI reviewer with complete context, design rationale, confirmed results, and identified gaps so that further improvements or mistakes can be identified without ambiguity.*

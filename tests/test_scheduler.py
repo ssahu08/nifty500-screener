@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -434,3 +436,105 @@ def test_alert_failure_never_crashes_the_run(tmp_path, monkeypatch) -> None:
     status = scheduler.run_status("Echo")
     assert status["state"] == "done"
     assert status["error"] is None
+
+
+# -- independent concurrent runs --------------------------------------------
+def _wait_until(predicate, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+class _AutoStrategy(Strategy):
+    """Auto interval strategy that counts scans and can block on demand."""
+
+    def __init__(self, name: str, release: threading.Event | None = None) -> None:
+        self._name = name
+        self.release = release
+        self.started = threading.Event()
+        self.scans = 0
+
+    @property
+    def metadata(self) -> StrategyMetadata:
+        return StrategyMetadata(
+            name=self._name,
+            description="auto test strategy",
+            category=Category.INTRADAY,
+            universe="NIFTY_50",
+            schedule_type="auto",
+            timeframes=["daily"],
+            frequency_minutes=10,
+        )
+
+    def scan(self, data, settings):
+        self.scans += 1
+        self.started.set()
+        if self.release is not None:
+            self.release.wait(5)
+        return []
+
+
+def _auto_scheduler(tmp_path, monkeypatch, strategies):
+    from app.storage.db import SignalStore
+
+    monkeypatch.setattr("app.scheduler.jobs.is_market_open", lambda now: True)
+    settings = Settings(_env_file=None, database_path=str(tmp_path / "concurrent.db"))
+    return StrategyScheduler(
+        settings, strategies, _FakeProvider(), SignalStore(settings)
+    )
+
+
+def test_tick_does_not_block_on_a_slow_strategy(tmp_path, monkeypatch) -> None:
+    """A slow scan must not delay the other due strategies."""
+    release = threading.Event()
+    slow = _AutoStrategy("Slow", release=release)
+    fast = _AutoStrategy("Fast")
+    scheduler = _auto_scheduler(tmp_path, monkeypatch, {"Slow": slow, "Fast": fast})
+
+    scheduler.tick()  # returns immediately instead of waiting for Slow
+
+    assert slow.started.wait(2)
+    assert _wait_until(lambda: scheduler.run_status("Fast")["state"] == "done")
+    assert scheduler.run_status("Slow")["state"] == "running"
+
+    release.set()
+    assert _wait_until(lambda: scheduler.run_status("Slow")["state"] == "done")
+
+
+def test_due_strategy_is_not_started_twice(tmp_path, monkeypatch) -> None:
+    """The running guard prevents overlapping runs of the same strategy."""
+    release = threading.Event()
+    slow = _AutoStrategy("Slow", release=release)
+    scheduler = _auto_scheduler(tmp_path, monkeypatch, {"Slow": slow})
+
+    scheduler.tick()
+    assert slow.started.wait(2)
+    scheduler.tick()  # still due: _last_run is only stamped on completion
+    time.sleep(0.1)
+
+    assert slow.scans == 1
+
+    release.set()
+    assert _wait_until(lambda: scheduler.run_status("Slow")["state"] == "done")
+    # Completion stamped _last_run, so the next tick does not restart it.
+    scheduler.tick()
+    time.sleep(0.1)
+    assert slow.scans == 1
+
+
+def test_manual_run_is_ignored_while_strategy_is_running(tmp_path, monkeypatch) -> None:
+    release = threading.Event()
+    slow = _AutoStrategy("Slow", release=release)
+    scheduler = _auto_scheduler(tmp_path, monkeypatch, {"Slow": slow})
+
+    scheduler.tick()
+    assert slow.started.wait(2)
+
+    assert scheduler.run_manual("Slow") == 0
+    assert slow.scans == 1
+
+    release.set()
+    assert _wait_until(lambda: scheduler.run_status("Slow")["state"] == "done")

@@ -12,6 +12,8 @@ ones rather than refetching history".
 from __future__ import annotations
 
 import json
+import os
+import threading
 from pathlib import Path
 
 import pandas as pd
@@ -26,6 +28,9 @@ class CandleCache:
         self.root = Path(root)
         self.namespace = namespace
         self.root.mkdir(parents=True, exist_ok=True)
+        #: Serialise writes: concurrent strategy runs may fetch the same
+        #: symbol at the same time and must not interleave cache updates.
+        self._write_lock = threading.Lock()
 
     def _path(self, key: str) -> Path:
         safe = key.replace("/", "_").replace("|", "_").replace(":", "_")
@@ -65,9 +70,17 @@ class CandleCache:
         return subset[OHLCV_COLUMNS]
 
     def put(self, key: str, df: pd.DataFrame) -> None:
-        """Merge ``df`` into the cache for ``key`` (append/overwrite duplicates)."""
+        """Merge ``df`` into the cache for ``key`` (append/overwrite duplicates).
+
+        Writes are serialised and atomic (temp file + ``os.replace``) so a
+        concurrent strategy run can never read a half-written cache file.
+        """
         if df is None or df.empty:
             return
+        with self._write_lock:
+            self._put_locked(key, df)
+
+    def _put_locked(self, key: str, df: pd.DataFrame) -> None:
         path = self._path(key)
         path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -99,10 +112,15 @@ class CandleCache:
 
         records = merged.reset_index()
         records["time"] = merged.index.strftime("%Y-%m-%dT%H:%M:%S%z")
-        path.write_text(
-            json.dumps({"key": key, "data": records.to_dict(orient="records")}, default=str),
-            encoding="utf-8",
+        payload = json.dumps(
+            {"key": key, "data": records.to_dict(orient="records")}, default=str
         )
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            tmp.write_text(payload, encoding="utf-8")
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
 
     def invalidate(self, key: str) -> None:
         path = self._path(key)

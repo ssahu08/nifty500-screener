@@ -1,10 +1,14 @@
 """Scheduler for automatic and manual strategy runs.
 
 Uses APScheduler with an interval tick. On each tick it works out which
-auto-strategies are due, fetches the union of their universes **once**, then
-evaluates every due strategy on that shared in-memory data (the BRD
-fetch-once-evaluate-many rule). A strategy or API failure never crashes the
-service (NFR-6).
+auto-strategies are due and dispatches each to its own background thread, so
+one slow full-universe fetch cannot delay the others. A strategy is never run
+twice concurrently, and a strategy or API failure never crashes the service
+(NFR-6).
+
+Within a single run, the union of the due strategies' universes is fetched
+**once**, then every strategy in that run evaluates the shared in-memory data
+(the BRD fetch-once-evaluate-many rule).
 
 Auto-strategies come in two flavours:
 
@@ -19,6 +23,7 @@ is fetched (the BRD two-stage intraday scan).
 
 from __future__ import annotations
 
+import threading
 from datetime import datetime, time, timedelta, timezone
 from time import monotonic
 
@@ -59,6 +64,13 @@ class StrategyScheduler:
         #: Live run progress per strategy (`run_status` reads this; the
         #: dashboard polls it to animate what a manual run is doing).
         self.progress: dict[str, dict] = {}
+        #: A strategy may not run twice at once (a tick can fire while the
+        #: previous run is still fetching, and a manual click can race the
+        #: auto tick). Each due strategy runs in its own thread so a slow
+        #: full-universe scan never delays the others.
+        self._run_lock = threading.Lock()
+        self._running: set[str] = set()
+        self._threads: dict[str, threading.Thread] = {}
 
     # -- scheduling ---------------------------------------------------------
     def schedule_auto_strategies(self) -> None:
@@ -85,7 +97,14 @@ class StrategyScheduler:
 
     # -- tick / execution ---------------------------------------------------
     def tick(self) -> None:
-        """Run every auto-strategy that is due (interval or daily)."""
+        """Start every auto-strategy that is due (interval or daily).
+
+        Runs are dispatched to per-strategy daemon threads, so a slow
+        full-universe fetch (e.g. the 10-minute Doji scan) can no longer hold
+        the tick and starve the other strategies. ``_last_run`` is stamped
+        when a run *finishes*, so an interval strategy re-arms its frequency
+        from completion rather than restarting immediately.
+        """
         now = datetime.now(IST)
         for name, strategy in self.registry.items():
             meta = strategy.metadata
@@ -93,20 +112,23 @@ class StrategyScheduler:
                 continue
             if meta.run_at:
                 if self._is_daily_due(name, meta.run_at, now):
-                    self._run_auto_due([name], now)
+                    self._start_async(name)
                 continue
             if not is_market_open(now):
                 continue
             if self._is_due(name, meta.frequency_minutes, now):
-                self._run_auto_due([name], now)
+                self._start_async(name)
 
     def run_manual(self, strategy_name: str) -> int:
-        """Manually trigger a strategy and return the number of signals."""
+        """Manually trigger a strategy and return the number of signals.
+
+        If the same strategy is already running (auto or another manual
+        trigger), this returns 0 instead of starting a duplicate run.
+        """
         strategy = self.registry.get(strategy_name)
         if strategy is None:
             raise KeyError(f"Unknown strategy {strategy_name!r}")
-        count = self._run_auto_due([strategy_name], datetime.now(IST), manual=True)
-        return count
+        return self._run_auto_due([strategy_name], manual=True)
 
     def run_status(self, strategy_name: str) -> dict:
         """Snapshot of the strategy's latest/live run for the dashboard."""
@@ -177,10 +199,57 @@ class StrategyScheduler:
         last = self._last_run.get(name)
         return last is None or last.date() != now.date()
 
-    def _run_auto_due(
-        self, names: list[str], now: datetime, *, manual: bool = False
-    ) -> int:
+    def _start_async(self, name: str) -> bool:
+        """Claim ``name`` and run it in a background thread (non-blocking tick)."""
+        if not self._claim([name]):
+            logger.info("Skipping %s: previous run still in progress", name)
+            return False
+        thread = threading.Thread(
+            target=self._execute,
+            args=([name],),
+            kwargs={"manual": False},
+            name=f"strategy-run-{name}",
+            daemon=True,
+        )
+        with self._run_lock:
+            self._threads[name] = thread
+        try:
+            thread.start()
+        except Exception:  # noqa: BLE001 - never leave a strategy stuck as running
+            logger.exception("Could not start background run for %s", name)
+            self._release([name])
+            return False
+        return True
+
+    def _claim(self, names: list[str]) -> bool:
+        """Reserve ``names`` atomically; False if any is already running."""
+        with self._run_lock:
+            if any(name in self._running for name in names):
+                return False
+            self._running.update(names)
+            return True
+
+    def _release(self, names: list[str]) -> None:
+        with self._run_lock:
+            for name in names:
+                self._running.discard(name)
+                self._threads.pop(name, None)
+
+    def _run_auto_due(self, names: list[str], *, manual: bool = False) -> int:
+        """Run the given strategies synchronously (used by manual triggers)."""
+        if not self._claim(names):
+            logger.info("Skipping %s: previous run still in progress", names)
+            return 0
+        return self._execute(names, manual=manual)
+
+    def _execute(self, names: list[str], *, manual: bool = False) -> int:
         """Fetch the due strategies' universes once and run each on shared data."""
+        try:
+            return self._execute_inner(names, manual=manual)
+        finally:
+            self._release(names)
+
+    def _execute_inner(self, names: list[str], *, manual: bool = False) -> int:
         total = 0
         for name in names:
             self._progress_start(name, manual)
@@ -206,7 +275,9 @@ class StrategyScheduler:
                 strategy._trigger_mode = "manual" if manual else "auto"
                 signals = strategy.scan(strategy_data, self.settings)
                 new_signals = self.store.save_run(name, signals)
-                self._last_run[name] = now
+                # Stamp completion, not start: a long scan must not make the
+                # next tick think the strategy is due again immediately.
+                self._last_run[name] = datetime.now(IST)
                 total += len(signals)
                 self._progress_finish(name, signals=len(signals), error=None)
                 if signals:

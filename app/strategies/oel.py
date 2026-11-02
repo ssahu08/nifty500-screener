@@ -42,6 +42,7 @@ import pandas as pd
 
 from app.config import Settings
 from app.core.market import CONTINUOUS_CLOSE
+from app.data.provider import Quote, normalize_symbol
 from app.strategies.base import Category, Signal, Strategy, StrategyMetadata
 from app.strategies.indicators import closed_candles, volume_ratio
 
@@ -274,6 +275,26 @@ class OpenEqualsLowStrategy(Strategy):
             frequency_minutes=10,
             candle_interval="10m",
         )
+
+    # -------------------------------------------------------------- prefilter
+    def prefilter(self, quotes: dict[str, Quote], settings: Settings) -> list[str]:
+        """Keep only symbols whose day open is still the day low.
+
+        The batched quote already carries today's open and low, which is the
+        entire OEL gate. Fetching 10-minute and daily history for all ~500
+        symbols every 10 minutes otherwise burns the whole Fyers quota and
+        makes a scan take ~25 minutes. Symbols with a missing/incomplete quote
+        are kept so a data hiccup can never hide a signal.
+        """
+        kept: list[str] = []
+        for symbol in self.get_universe(settings):
+            quote = quotes.get(normalize_symbol(symbol))
+            if quote is None or not quote.open or not quote.low:
+                kept.append(symbol)
+                continue
+            if _open_equals_low(quote.open, quote.low):
+                kept.append(symbol)
+        return kept
 
     # ------------------------------------------------------------------ scan
     def scan(

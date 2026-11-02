@@ -137,8 +137,12 @@ logic (all providers faked/mocked - no network).
   hours, or the first run of the next session) stores nothing new, and
   Telegram is only alerted for newly stored signals.
 * `app.scheduler.jobs.StrategyScheduler` - APScheduler 1-minute tick. Each tick
-  works out which auto-strategies are due, fetches the union of their universes
-  **once**, then runs every due strategy on that shared data
+  works out which auto-strategies are due and starts each one in its own
+  background thread, so a slow full-universe scan (e.g. the 10-minute Doji) can
+  never block another strategy. A per-strategy running guard prevents
+  overlapping runs, and `_last_run` is stamped on completion so a long scan
+  re-arms its cadence instead of restarting immediately. Within one run the
+  union of the strategies' universes is still fetched **once**
   (fetch-once-evaluate-many). Strategies can run on a fixed cadence
   (`frequency_minutes`) or once per trading day at a set time (`run_at`, with a
   30-minute catch-up window). Market-hours and per-strategy failures are handled
@@ -260,6 +264,14 @@ equal the day's low price** - the stock never traded below its open.
   trivially the open for almost every stock. It stops at the 15:15 continuous
   close so the EOD daily candle takes over.
 * **Daily EOD variant**: the last completed daily candle must have open == low.
+* **Quote prefilter**: before any candle history is fetched, one batched quote
+  per symbol checks `open == low` (2-decimal match) on the live day. This is
+  exactly the same gate as the 10-minute variant (the quote's day low is the
+  minimum of today's bars) and, after the close, exactly the daily candle's
+  gate. Only matches - plus symbols with a missing/incomplete quote - get
+  10-minute and daily candles, which keeps a run to seconds instead of
+  ~25 minutes for all 501 symbols. Matches are never filtered out; they are
+  only ranked by the quality score below.
 * Price and `move_pct` are the latest completed close and the move from the
   day's open (not stale first-candle values); the alert shows `open=... low=...`
   so the criterion is verifiable.
