@@ -16,34 +16,44 @@ Two modes are supported:
 
 Common rules (both modes):
 
-* Trade only on Nifty weekly expiry day (Tuesday). SEBI directive (Oct 2024):
-  only one weekly index per exchange; NSE kept Nifty weekly on Tuesday from
-  1 Sep 2025.
+* Trade only on a Nifty expiry day (normally Tuesday). SEBI directive (Oct
+  2024): only one weekly index per exchange; NSE kept Nifty weekly on Tuesday
+  from 1 Sep 2025. Holiday-shifted expiries (Monday) are handled by
+  :mod:`app.data.options`.
 * Entry window: after 1:00 PM IST (preferred 1:15-1:30 PM). Time decay has
   accelerated by then, pulling premiums into the zone.
 * Stop loss: combined premium below 10 (simple) or 8 (averaging).
-* Time stop: after 2:35 PM, if the market is range-bound the SL should not
-  hit; time premium decay is in your favour.
-* Hard exit: all positions closed at 3:30 PM (CAS candle) - never hold to
-  expiry.
-* Position sizing: max 5% of capital per trade (configurable), minimum 2 lots
-  so that half can be booked and the rest trailed.
+* Hard exit: all positions closed at 3:30 PM - never hold to expiry.
+* Position sizing: the total premium paid may never exceed the configured
+  capital cap (default 5% of capital). One straddle lot costs
+  ``combined_premium * lot_size`` (the combined premium already includes both
+  legs). If fewer than two lots fit, the entry is skipped rather than
+  breaching the cap.
 * No fixed target - profit is unlimited. Book half when the premium doubles
-  (simple) or at the per-level zones (averaging), trail the rest.
+  (simple) or at the per-level zones (averaging), then trail the rest.
+
+The strategy is **advisory only**: it never places orders. It also maintains a
+live :meth:`snapshot` so the dashboard can show the tentative strike and both
+option legs before an entry is triggered.
 """
 
 from __future__ import annotations
 
+import copy
+import threading
 from dataclasses import dataclass, field
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from app.config import Settings
 from app.core.logging import get_logger
+from app.core.market import is_market_open
 from app.data.options import (
     NIFTY_SPOT_SYMBOL,
+    expiry_kind,
+    is_nifty_expiry_day,
     next_weekly_expiry,
-    nifty_option_symbol,
+    nifty_option_symbol_candidates,
     round_to_nifty_strike,
 )
 from app.strategies.base import Category, Signal, Strategy, StrategyMetadata
@@ -61,8 +71,8 @@ ENTRY_ZONE_MID = 23.0    # midpoint - the strategy is named after this
 # ---------------------------------------------------------------------------
 # Stop-loss (combined premium)
 # ---------------------------------------------------------------------------
-SL_SIMPLE = 10.0    # simple mode: exit when combined premium < 10
-SL_AVERAGING = 8.0   # averaging mode: exit when combined premium < 8
+SL_SIMPLE = 10.0      # simple mode: exit when combined premium < 10
+SL_AVERAGING = 8.0    # averaging mode: exit when combined premium < 8
 
 # ---------------------------------------------------------------------------
 # Averaging mode entry levels (50-30-20)
@@ -90,6 +100,9 @@ ENTRY_START = time(13, 0)      # 1:00 PM - earliest entry
 TIME_SL_START = time(14, 35)   # 2:35 PM - time-based SL activates
 MARKET_EXIT = time(15, 30)     # 3:30 PM - hard market close exit
 
+#: How long a cached snapshot may be served before the API refetches quotes.
+SNAPSHOT_TTL_SECONDS = 60.0
+
 
 @dataclass
 class _HedgeState:
@@ -101,19 +114,30 @@ class _HedgeState:
 
     mode: str = "simple"          # "simple" or "averaging"
     entered: bool = False         # whether a position is currently open
-    expiry: str = ""              # expiry date string (e.g. "25JUN2026")
+    expiry: str = ""              # expiry date (ISO, e.g. "2026-11-03")
+    expiry_kind: str = ""         # "weekly" or "monthly"
     strike: int = 0               # ATM strike
     ce_symbol: str = ""           # FYERS symbol for the CE leg
     pe_symbol: str = ""           # FYERS symbol for the PE leg
     lots: int = 0                 # total straddle lots (1 lot = 1 CE + 1 PE)
-    entry_premiums: list[float] = field(default_factory=list)  # combined premium at each entry
+    entry_premiums: list[float] = field(default_factory=list)  # combined premium per entry
     entry_levels: list[str] = field(default_factory=list)      # e.g. ["50", "30", "20"]
+    entry_lots: list[int] = field(default_factory=list)        # lots added per entry
     entry_times: list[datetime] = field(default_factory=list)
     average_entry: float = 0.0    # volume-weighted average combined premium
     booked_lots: int = 0          # lots already booked for profit
+    booked_levels: list[str] = field(default_factory=list)     # profit targets already taken
     sl_price: float = 0.0         # combined-premium stop level
-    exit_sent: bool = False       # whether an EXIT signal has been emitted
+    exit_sent: bool = False       # whether a full EXIT signal has been emitted
     last_entry_time: datetime | None = None
+    # Latest market snapshot (kept even when no position is open).
+    last_spot: float = 0.0
+    last_ce_premium: float = 0.0
+    last_pe_premium: float = 0.0
+    last_combined: float = 0.0
+    last_action: str = ""
+    last_action_time: datetime | None = None
+    last_exit_reason: str = ""
 
 
 class NiftyHedge23Strategy(Strategy):
@@ -121,7 +145,12 @@ class NiftyHedge23Strategy(Strategy):
 
     def __init__(self) -> None:
         self._state = _HedgeState()
-        self._today = datetime.now(IST).date()
+        self._today: date | None = None
+        self._snapshot: dict = {}
+        self._snapshot_at: datetime | None = None
+        # The scheduler and the dashboard API may touch the strategy at the
+        # same time; one lock keeps the position state consistent.
+        self._lock = threading.RLock()
 
     # -- metadata -----------------------------------------------------------
     @property
@@ -142,16 +171,84 @@ class NiftyHedge23Strategy(Strategy):
         )
 
     def get_universe(self, settings: Settings) -> list[str]:
-        """Nifty spot symbol — needed so the scheduler includes it in shared data.
-
-        The strategy fetches option quotes directly via the provider, but the
-        scheduler needs at least one symbol in ``data`` to invoke scan().
-        """
-        return [NIFTY_SPOT_SYMBOL]
+        """No candle universe - the strategy fetches option quotes directly."""
+        return []
 
     def prefilter(self, quotes, settings):  # type: ignore[override]
         """Not used - quotes are fetched directly inside scan()."""
         return None
+
+    # -- dashboard snapshot -------------------------------------------------
+    def snapshot(self) -> dict:
+        """Return a copy of the latest live snapshot (safe for the API)."""
+        with self._lock:
+            if not self._snapshot:
+                return {
+                    "status": "not_started",
+                    "updated_at": None,
+                    "advisory": "Advisory only - the screener never places orders.",
+                }
+            payload = copy.deepcopy(self._snapshot)
+            if self._snapshot_at is not None:
+                payload["age_seconds"] = round(
+                    (datetime.now(IST) - self._snapshot_at).total_seconds(), 1
+                )
+            return payload
+
+    def refresh_snapshot(self, settings: Settings) -> dict:
+        """Fetch fresh quotes for the dashboard, throttled by the TTL.
+
+        The scheduler already updates the snapshot every five minutes. The
+        dashboard polls more often, so this only refetches when the cached
+        snapshot is older than :data:`SNAPSHOT_TTL_SECONDS`.
+        """
+        with self._lock:
+            if self._snapshot_at is not None:
+                age = (datetime.now(IST) - self._snapshot_at).total_seconds()
+                if age < SNAPSHOT_TTL_SECONDS:
+                    return self.snapshot()
+
+            now = datetime.now(IST)
+            if not settings.hedge_23_enabled:
+                self._base_snapshot(settings, now, next_weekly_expiry(now.date()),
+                                    is_nifty_expiry_day(now.date()))
+                self._snapshot["status"] = "disabled"
+                return self.snapshot()
+
+            self._reset_for_day(settings, now)
+            expiry = next_weekly_expiry(now.date())
+            expiry_day = is_nifty_expiry_day(now.date())
+            self._base_snapshot(settings, now, expiry, expiry_day)
+
+            if not expiry_day:
+                self._snapshot["status"] = "not_expiry_day"
+                return self.snapshot()
+            if not is_market_open(now):
+                self._snapshot["status"] = "market_closed"
+                return self.snapshot()
+
+            try:
+                spot, ce, pe, ce_sym, pe_sym, strike = self._fetch_leg_data(
+                    settings, now
+                )
+            except Exception as exc:  # noqa: BLE001 - never crash the API
+                logger.warning("Hedge 23: snapshot fetch failed: %s", exc)
+                self._snapshot["status"] = "data_unavailable"
+                self._snapshot["error"] = str(exc)
+                self._snapshot_at = now
+                return self.snapshot()
+
+            if spot is None or ce is None or pe is None:
+                self._snapshot["status"] = "data_unavailable"
+                self._snapshot_at = now
+                return self.snapshot()
+
+            combined = round(ce + pe, 2)
+            self._apply_quote_snapshot(
+                settings, now, spot, ce, pe, combined, ce_sym, pe_sym, strike
+            )
+            self._set_status(now)
+            return self.snapshot()
 
     # -- main scan ----------------------------------------------------------
     def scan(
@@ -159,89 +256,351 @@ class NiftyHedge23Strategy(Strategy):
         data: dict,  # unused - we fetch quotes directly
         settings: Settings,
     ) -> list[Signal]:
-        if not settings.hedge_23_enabled:
-            return []
+        with self._lock:
+            now = datetime.now(IST)
 
-        now = datetime.now(IST)
-
-        # Reset per-day state on a new trading day.
-        if now.date() != self._today:
-            self._today = now.date()
-            self._state = _HedgeState(mode=settings.hedge_23_mode)
-            logger.info(
-                "Hedge 23: new day %s, mode=%s", self._today, self._state.mode
-            )
-
-        signals: list[Signal] = []
-
-        # Only trade on Nifty weekly expiry (Tuesday).
-        # SEBI directive (Oct 2024): only one weekly index per exchange;
-        # NSE kept Nifty weekly on Tuesday from 1 Sep 2025.
-        if now.weekday() != 1:
-            return signals
-
-        # Entry window: after 1:00 PM. Hard exit at 3:30 PM.
-        if now.time() < ENTRY_START:
-            return signals
-        if now.time() >= MARKET_EXIT:
-            if self._state.entered and not self._state.exit_sent:
-                signals.append(self._emit_exit(now, "market_close", settings))
-                self._state.exit_sent = True
-            return signals
-
-        # Fetch live data: Nifty spot + ATM CE + PE quotes.
-        try:
-            spot, ce_premium, pe_premium, ce_sym, pe_sym, strike = self._fetch_leg_data(
-                settings, now
-            )
-        except Exception as exc:  # noqa: BLE001 - never crash the scheduler
-            logger.warning("Hedge 23: failed to fetch option data: %s", exc)
-            return signals
-
-        if spot is None or ce_premium is None or pe_premium is None:
-            return signals
-
-        combined = round(ce_premium + pe_premium, 2)
-
-        # Update state with latest symbols/strike.
-        self._state.ce_symbol = ce_sym
-        self._state.pe_symbol = pe_sym
-        self._state.strike = strike
-
-        # --- EXIT checks (position open) ---------------------------------
-        if self._state.entered:
-            exit_reason = self._check_exit(now, combined, settings)
-            if exit_reason:
-                signals.append(self._emit_exit(now, exit_reason, combined, settings))
-                self._state.entered = False
-                self._state.exit_sent = True
-                logger.info(
-                    "Hedge 23: EXIT %s at combined=%.2f lots=%d",
-                    exit_reason, combined, self._state.lots,
+            if not settings.hedge_23_enabled:
+                self._base_snapshot(
+                    settings, now, next_weekly_expiry(now.date()),
+                    is_nifty_expiry_day(now.date()),
                 )
-            return signals
+                self._snapshot["status"] = "disabled"
+                return []
 
-        # --- ENTRY checks (no position) ----------------------------------
-        entry_level = self._should_enter(now, combined, settings)
-        if entry_level is None:
-            return signals
+            # Reset per-day state on a new trading day (also initialises the
+            # mode from settings on the very first run of the process).
+            self._reset_for_day(settings, now)
 
-        lots = self._position_size(settings, combined)
-        if lots < 2:
-            logger.warning(
-                "Hedge 23: position size %d lots < 2, skipping entry", lots
+            expiry = next_weekly_expiry(now.date())
+            expiry_day = is_nifty_expiry_day(now.date())
+            self._base_snapshot(settings, now, expiry, expiry_day)
+
+            # Only trade on a Nifty expiry day (normally Tuesday; a holiday
+            # can shift it to Monday).
+            if not expiry_day:
+                self._snapshot["status"] = "not_expiry_day"
+                return []
+
+            signals: list[Signal] = []
+
+            # Fetch live data: Nifty spot + ATM CE + PE quotes. This happens
+            # even before 13:00 so the dashboard can show the tentative legs.
+            fetch_error: str | None = None
+            spot = ce = pe = None
+            ce_sym = pe_sym = ""
+            strike = 0
+            try:
+                spot, ce, pe, ce_sym, pe_sym, strike = self._fetch_leg_data(
+                    settings, now
+                )
+            except Exception as exc:  # noqa: BLE001 - never crash the scheduler
+                fetch_error = str(exc)
+                logger.warning("Hedge 23: failed to fetch option data: %s", exc)
+
+            combined = self._state.last_combined
+            if spot is not None and ce is not None and pe is not None:
+                combined = round(ce + pe, 2)
+                self._apply_quote_snapshot(
+                    settings, now, spot, ce, pe, combined, ce_sym, pe_sym, strike
+                )
+            else:
+                self._snapshot["status"] = "data_unavailable"
+                if fetch_error:
+                    self._snapshot["error"] = fetch_error
+
+            # Hard exit at 3:30 PM. Use the last known premium if the final
+            # fetch failed, so a position is never left open silently.
+            if now.time() >= MARKET_EXIT:
+                if self._state.entered and not self._state.exit_sent:
+                    exit_price = combined if combined > 0 else self._state.average_entry
+                    signals.append(
+                        self._emit_exit(now, "market_close", exit_price, settings)
+                    )
+                    self._close_position(now, "market_close")
+                self._snapshot["status"] = "market_closed"
+                return signals
+
+            if spot is None or ce is None or pe is None:
+                return signals
+
+            # Before 1:00 PM: show the tentative legs, but do not enter.
+            if now.time() < ENTRY_START:
+                self._set_status(now)
+                return signals
+
+            # --- position management -------------------------------------
+            if self._state.entered:
+                # 1) Hard stop loss.
+                sl_reason = self._check_sl(combined)
+                if sl_reason:
+                    signals.append(
+                        self._emit_exit(now, sl_reason, combined, settings)
+                    )
+                    self._close_position(now, sl_reason)
+                    logger.info(
+                        "Hedge 23: EXIT %s at combined=%.2f", sl_reason, combined
+                    )
+                    return signals
+
+                # 2) Partial profit booking (book some lots, trail the rest).
+                booking = self._check_profit_take(combined)
+                if booking is not None:
+                    reason, lots_to_book, level = booking
+                    signals.append(
+                        self._emit_book(
+                            now, reason, level, combined, lots_to_book, settings
+                        )
+                    )
+                    self._book_lots(now, reason, level, lots_to_book)
+                    remaining = self._state.lots - self._state.booked_lots
+                    if remaining <= 0:
+                        self._close_position(now, reason)
+                    else:
+                        self._set_status(now)
+                    logger.info(
+                        "Hedge 23: BOOK %s level=%s lots=%d remaining=%d combined=%.2f",
+                        reason, level, lots_to_book, remaining, combined,
+                    )
+                    return signals
+
+                # 3) Averaging scale-in while the position is open.
+                if self._state.mode == "averaging":
+                    entry_level = self._should_enter(now, combined, settings)
+                    if entry_level is not None:
+                        lots = self._add_size(settings, combined)
+                        if lots >= 2:
+                            self._enter_position(
+                                now, combined, ce_sym, pe_sym, strike,
+                                lots, entry_level, settings,
+                            )
+                            signals.append(
+                                self._emit_entry(
+                                    now, combined, lots, entry_level, settings
+                                )
+                            )
+                            logger.info(
+                                "Hedge 23: ADD %s at combined=%.2f lots=%d",
+                                entry_level, combined, lots,
+                            )
+                self._set_status(now)
+                return signals
+
+            # --- fresh entry ---------------------------------------------
+            entry_level = self._should_enter(now, combined, settings)
+            if entry_level is None:
+                self._set_status(now)
+                return signals
+
+            # Simple mode sizes the whole straddle from the capital cap;
+            # averaging mode adds the fixed 2-lot ladder step within the
+            # remaining cap.
+            lots = (
+                self._add_size(settings, combined)
+                if self._state.mode == "averaging"
+                else self._position_size(settings, combined)
             )
+            if lots < 2:
+                max_capital = (
+                    settings.hedge_23_capital * settings.hedge_23_max_capital_pct
+                )
+                note = (
+                    f"Only {lots} lot(s) fit the ₹{max_capital:,.0f} capital cap "
+                    f"at combined ₹{combined:.2f}; entry skipped."
+                )
+                self._snapshot["note"] = note
+                logger.info("Hedge 23: %s", note)
+                self._set_status(now)
+                return signals
+
+            self._enter_position(
+                now, combined, ce_sym, pe_sym, strike, lots, entry_level, settings
+            )
+            signals.append(
+                self._emit_entry(now, combined, lots, entry_level, settings)
+            )
+            logger.info(
+                "Hedge 23: ENTRY %s at combined=%.2f lots=%d strike=%d",
+                entry_level, combined, lots, strike,
+            )
+            self._set_status(now)
             return signals
 
-        self._enter_position(
-            now, combined, ce_sym, pe_sym, strike, lots, entry_level, settings
+    # -- state / snapshot helpers ------------------------------------------
+    def _reset_for_day(self, settings: Settings, now: datetime) -> None:
+        if self._today == now.date():
+            return
+        self._today = now.date()
+        mode = (settings.hedge_23_mode or "simple").strip().lower()
+        if mode not in {"simple", "averaging"}:
+            logger.warning("Hedge 23: unknown mode %r, using simple", mode)
+            mode = "simple"
+        self._state = _HedgeState(mode=mode)
+        logger.info("Hedge 23: new day %s, mode=%s", self._today, mode)
+
+    def _base_snapshot(
+        self,
+        settings: Settings,
+        now: datetime,
+        expiry: date,
+        expiry_day: bool,
+    ) -> None:
+        max_capital = settings.hedge_23_capital * settings.hedge_23_max_capital_pct
+        self._snapshot = {
+            "strategy": self.metadata.name,
+            "enabled": settings.hedge_23_enabled,
+            "mode": self._state.mode,
+            "today": now.date().isoformat(),
+            "is_expiry_day": expiry_day,
+            "expiry": expiry.isoformat(),
+            "expiry_kind": expiry_kind(expiry),
+            "expiry_label": expiry.strftime("%d %b %Y"),
+            "entry_window": "13:00-15:30 IST",
+            "entry_zone": {
+                "low": ENTRY_ZONE_LOW,
+                "high": ENTRY_ZONE_HIGH,
+                "mid": ENTRY_ZONE_MID,
+            },
+            "averaging_levels": [AVG_LEVEL_1, AVG_LEVEL_2, AVG_LEVEL_3],
+            "sl": {
+                "simple": SL_SIMPLE,
+                "averaging": SL_AVERAGING,
+            },
+            "capital": settings.hedge_23_capital,
+            "max_capital": round(max_capital, 2),
+            "lot_size": settings.hedge_23_lot_size,
+            "strike_step": 50,
+            "status": "waiting",
+            "next_action": "WAIT",
+            "updated_at": now.isoformat(),
+            "advisory": (
+                "Advisory only - the screener never places orders. "
+                "Verify premiums and strikes in your broker terminal."
+            ),
+        }
+
+    def _apply_quote_snapshot(
+        self,
+        settings: Settings,
+        now: datetime,
+        spot: float,
+        ce: float,
+        pe: float,
+        combined: float,
+        ce_sym: str,
+        pe_sym: str,
+        strike: int,
+    ) -> None:
+        st = self._state
+        st.last_spot = spot
+        st.last_ce_premium = ce
+        st.last_pe_premium = pe
+        st.last_combined = combined
+        st.strike = strike
+        st.ce_symbol = ce_sym
+        st.pe_symbol = pe_sym
+        st.expiry = next_weekly_expiry(now.date()).isoformat()
+        st.expiry_kind = expiry_kind(next_weekly_expiry(now.date()))
+
+        recommended = (
+            self._add_size(settings, combined)
+            if st.entered or st.mode == "averaging"
+            else self._position_size(settings, combined)
         )
-        signals.append(self._emit_entry(now, combined, lots, entry_level, settings))
-        logger.info(
-            "Hedge 23: ENTRY %s at combined=%.2f lots=%d strike=%d",
-            entry_level, combined, lots, strike,
+        next_level = self._next_level(combined)
+
+        self._snapshot.update(
+            {
+                "spot": round(spot, 2),
+                "atm_strike": strike,
+                "ce_symbol": ce_sym,
+                "pe_symbol": pe_sym,
+                "ce_premium": round(ce, 2),
+                "pe_premium": round(pe, 2),
+                "combined_premium": combined,
+                "in_entry_zone": ENTRY_ZONE_LOW <= combined <= ENTRY_ZONE_HIGH,
+                "next_level": next_level,
+                "recommended_lots": recommended,
+                "cost_per_lot": round(combined * settings.hedge_23_lot_size, 2),
+                "recommended_cost": round(
+                    recommended * combined * settings.hedge_23_lot_size, 2
+                ),
+                "tentative": {
+                    "strike": strike,
+                    "ce_symbol": ce_sym,
+                    "pe_symbol": pe_sym,
+                    "ce_premium": round(ce, 2),
+                    "pe_premium": round(pe, 2),
+                    "combined_premium": combined,
+                    "lots": recommended,
+                    "cost": round(
+                        recommended * combined * settings.hedge_23_lot_size, 2
+                    ),
+                },
+                "position": self._position_snapshot(),
+                "updated_at": now.isoformat(),
+            }
         )
-        return signals
+        self._snapshot_at = now
+
+    def _position_snapshot(self) -> dict:
+        st = self._state
+        return {
+            "open": st.entered,
+            "lots": st.lots,
+            "remaining_lots": max(0, st.lots - st.booked_lots),
+            "average_entry": st.average_entry,
+            "booked_lots": st.booked_lots,
+            "booked_levels": list(st.booked_levels),
+            "entry_levels": list(st.entry_levels),
+            "entry_premiums": list(st.entry_premiums),
+            "entry_lots": list(st.entry_lots),
+            "entry_times": [t.isoformat() for t in st.entry_times],
+            "sl_price": st.sl_price,
+            "last_action": st.last_action,
+            "last_action_time": (
+                st.last_action_time.isoformat() if st.last_action_time else None
+            ),
+            "last_exit_reason": st.last_exit_reason,
+        }
+
+    def _set_status(self, now: datetime) -> None:
+        st = self._state
+        self._snapshot["position"] = self._position_snapshot()
+        if st.entered:
+            self._snapshot["status"] = "position_open"
+            self._snapshot["next_action"] = (
+                "ADD" if self._next_level(st.last_combined) else "HOLD"
+            )
+            return
+        if now.time() < ENTRY_START:
+            self._snapshot["status"] = "waiting_entry_window"
+            self._snapshot["next_action"] = "WAIT"
+            return
+        if self._next_level(self._snapshot.get("combined_premium")):
+            self._snapshot["status"] = "entry_zone"
+            self._snapshot["next_action"] = "ENTRY"
+        else:
+            self._snapshot["status"] = "waiting_zone"
+            self._snapshot["next_action"] = "WAIT"
+
+    def _next_level(self, combined: float | None) -> str | None:
+        """Return the next actionable level for the current mode/position."""
+        if combined is None:
+            return None
+        st = self._state
+        if st.mode == "simple":
+            if st.entered:
+                return None
+            return "simple" if ENTRY_ZONE_LOW <= combined <= ENTRY_ZONE_HIGH else None
+
+        levels = set(st.entry_levels)
+        if "50" not in levels and combined <= AVG_LEVEL_1:
+            return "50"
+        if "50" in levels and "30" not in levels and combined <= AVG_LEVEL_2:
+            return "30"
+        if "30" in levels and "20" not in levels and combined <= AVG_LEVEL_3:
+            return "20"
+        return None
 
     # -- data fetching ------------------------------------------------------
     def _fetch_leg_data(
@@ -249,21 +608,15 @@ class NiftyHedge23Strategy(Strategy):
     ) -> tuple[float | None, float | None, float | None, str, str, int]:
         """Return (spot, ce_premium, pe_premium, ce_symbol, pe_symbol, strike).
 
-        Uses FYERS quotes directly. ATM strike is derived from the Nifty spot.
+        Uses FYERS quotes directly. The ATM strike is derived from the Nifty
+        spot and the symbols use the correct weekly/monthly FYERS format.
         """
         if self.provider is None:
             raise RuntimeError("Hedge 23: no market-data provider set")
 
-        # Expiry for this week (Tuesday). FYERS option symbols may use the
-        # calendar expiry day or the day before; try both.
         expiry = next_weekly_expiry(now.date())
-        self._state.expiry = expiry.strftime("%d%b%Y")
 
-        # Try candidate expiry day formats: the calendar expiry and the day
-        # before it (FYERS sometimes uses day-1 in option symbols).
-        expiry_candidates = [expiry, expiry - timedelta(days=1)]
-
-        # Nifty spot quote for ATM strike.
+        # Nifty spot quote for the ATM strike.
         spot_q = self.provider.get_quotes([NIFTY_SPOT_SYMBOL])
         spot_quote = spot_q.get(NIFTY_SPOT_SYMBOL)
         if spot_quote is None or not spot_quote.ltp:
@@ -272,33 +625,37 @@ class NiftyHedge23Strategy(Strategy):
 
         strike = round_to_nifty_strike(spot)
 
-        # Find the expiry day format that FYERS accepts for option symbols.
+        # Build paired CE/PE candidates (correct format first) and resolve
+        # them in one batched quote request.
+        ce_candidates = nifty_option_symbol_candidates(strike, "CE", expiry)
+        pe_candidates = nifty_option_symbol_candidates(strike, "PE", expiry)
+        pairs = list(zip(ce_candidates, pe_candidates, strict=False))
+        symbols = [sym for pair in pairs for sym in pair]
+        quotes = self.provider.get_quotes(symbols)
+
         ce_sym = pe_sym = ""
-        for exp in expiry_candidates:
-            ce_candidate = nifty_option_symbol(strike, "CE", exp)
-            pe_candidate = nifty_option_symbol(strike, "PE", exp)
-            test_q = self.provider.get_quotes([ce_candidate, pe_candidate])
-            ce_test = test_q.get(ce_candidate)
-            pe_test = test_q.get(pe_candidate)
-            # FYERS omits invalid symbols from the quotes response entirely
-            # (they return errmsg="Please provide a valid symbol"), so a
-            # valid symbol has a non-None Quote with an ltp.
-            ce_valid = ce_test is not None and ce_test.ltp is not None
-            pe_valid = pe_test is not None and pe_test.ltp is not None
-            if ce_valid and pe_valid:
+        ce_premium = pe_premium = None
+        for ce_candidate, pe_candidate in pairs:
+            ce_q = quotes.get(ce_candidate)
+            pe_q = quotes.get(pe_candidate)
+            if (
+                ce_q is not None
+                and ce_q.ltp is not None
+                and pe_q is not None
+                and pe_q.ltp is not None
+            ):
                 ce_sym, pe_sym = ce_candidate, pe_candidate
+                ce_premium = float(ce_q.ltp)
+                pe_premium = float(pe_q.ltp)
                 break
 
         if not ce_sym or not pe_sym:
-            logger.warning("Hedge 23: no valid option symbol found for strike %d", strike)
-            return None, None, None, "", "", 0
-
-        opt_q = self.provider.get_quotes([ce_sym, pe_sym])
-        ce_q = opt_q.get(ce_sym)
-        pe_q = opt_q.get(pe_sym)
-
-        ce_premium = float(ce_q.ltp) if ce_q and ce_q.ltp else None
-        pe_premium = float(pe_q.ltp) if pe_q and pe_q.ltp else None
+            logger.warning(
+                "Hedge 23: no valid option symbols for strike %d expiry %s "
+                "(tried %s)",
+                strike, expiry.isoformat(), ce_candidates,
+            )
+            return spot, None, None, "", "", strike
 
         return spot, ce_premium, pe_premium, ce_sym, pe_sym, strike
 
@@ -306,24 +663,27 @@ class NiftyHedge23Strategy(Strategy):
     def _should_enter(
         self, now: datetime, combined: float, settings: Settings
     ) -> str | None:
-        """Return the entry level string if we should enter, else None."""
-        if self._state.entered:
+        """Return the entry level string if we should enter/add, else None."""
+        st = self._state
+
+        gap = timedelta(minutes=max(0, settings.hedge_23_min_entry_gap_minutes))
+        if st.last_entry_time is not None and now - st.last_entry_time < gap:
             return None
 
-        mode = self._state.mode
-
-        if mode == "simple":
+        if st.mode == "simple":
+            if st.entered:
+                return None
             if ENTRY_ZONE_LOW <= combined <= ENTRY_ZONE_HIGH:
                 return "simple"
             return None
 
-        # Averaging mode (50-30-20).
-        levels = self._state.entry_levels
-        if AVG_LEVEL_1 not in levels and combined <= AVG_LEVEL_1:
+        # Averaging mode (50-30-20). Adds are allowed while a position is open.
+        levels = set(st.entry_levels)
+        if "50" not in levels and combined <= AVG_LEVEL_1:
             return "50"
-        if "50" in levels and AVG_LEVEL_2 not in levels and combined <= AVG_LEVEL_2:
+        if "50" in levels and "30" not in levels and combined <= AVG_LEVEL_2:
             return "30"
-        if "30" in levels and AVG_LEVEL_3 not in levels and combined <= AVG_LEVEL_3:
+        if "30" in levels and "20" not in levels and combined <= AVG_LEVEL_3:
             return "20"
         return None
 
@@ -340,38 +700,42 @@ class NiftyHedge23Strategy(Strategy):
     ) -> None:
         """Record a new entry (or add to an averaging position)."""
         st = self._state
-        st.entered = True
+        is_add = st.entered
+
+        if not is_add:
+            # Fresh position: clear any state left by an earlier trade.
+            st.entered = True
+            st.lots = lots
+            st.entry_premiums = [combined]
+            st.entry_levels = [entry_level]
+            st.entry_lots = [lots]
+            st.entry_times = [now]
+            st.average_entry = combined
+            st.booked_lots = 0
+            st.booked_levels = []
+            st.exit_sent = False
+            st.sl_price = SL_SIMPLE if st.mode == "simple" else SL_AVERAGING
+            st.last_exit_reason = ""
+        else:
+            st.lots += lots
+            st.entry_premiums.append(combined)
+            st.entry_levels.append(entry_level)
+            st.entry_lots.append(lots)
+            st.entry_times.append(now)
+            total_cost = sum(
+                premium * qty
+                for premium, qty in zip(
+                    st.entry_premiums, st.entry_lots, strict=False
+                )
+            )
+            st.average_entry = round(total_cost / st.lots, 2)
+
         st.strike = strike
         st.ce_symbol = ce_sym
         st.pe_symbol = pe_sym
         st.last_entry_time = now
-
-        if not st.entry_levels:
-            # First entry ever.
-            st.lots = lots
-            st.entry_premiums = [combined]
-            st.entry_levels = [entry_level]
-            st.entry_times = [now]
-            st.average_entry = combined
-            st.sl_price = SL_SIMPLE if st.mode == "simple" else SL_AVERAGING
-        else:
-            # Adding to an averaging position.
-            st.lots += lots
-            st.entry_premiums.append(combined)
-            st.entry_levels.append(entry_level)
-            st.entry_times.append(now)
-            # Volume-weighted average across all entry levels.
-            # Each level added LOTS_PER_LEVEL lots.
-            level_lots = [LOTS_PER_LEVEL] * len(st.entry_premiums)
-            # Adjust the last level to the actual lots added this time.
-            level_lots[-1] = lots
-            total_cost = sum(
-                premium * qty
-                for premium, qty in zip(
-                    st.entry_premiums, level_lots, strict=False
-                )
-            )
-            st.average_entry = round(total_cost / st.lots, 2)
+        st.last_action = "ADD" if is_add else "ENTRY"
+        st.last_action_time = now
 
         logger.info(
             "Hedge 23: position state lots=%d avg=%.2f sl=%.2f levels=%s",
@@ -379,63 +743,125 @@ class NiftyHedge23Strategy(Strategy):
         )
 
     # -- exit logic ---------------------------------------------------------
-    def _check_exit(
-        self, now: datetime, combined: float, settings: Settings
-    ) -> str | None:
-        """Return an exit reason string if the position should be closed."""
-        st = self._state
-
-        # Hard stop loss (combined premium breach).
-        if combined <= st.sl_price:
+    def _check_sl(self, combined: float) -> str | None:
+        """Return ``"sl"`` when the combined premium breaches the stop."""
+        if self._state.sl_price > 0 and combined <= self._state.sl_price:
             return "sl"
-
-        # Profit-take rules.
-        pt_reason = self._check_profit_take(combined)
-        if pt_reason:
-            return pt_reason
-
         return None
 
-    def _check_profit_take(self, combined: float) -> str | None:
-        """Partial profit booking based on entry level and mode."""
+    def _check_profit_take(
+        self, combined: float
+    ) -> tuple[str, int, str] | None:
+        """Return ``(reason, lots_to_book, level)`` for a partial booking."""
         st = self._state
-
-        if st.mode == "simple":
-            # Book half when premium doubles from entry.
-            if combined >= st.average_entry * 2 and st.booked_lots < st.lots // 2:
-                return "profit_half"
+        remaining = st.lots - st.booked_lots
+        if remaining <= 0:
             return None
 
-        # Averaging mode: per-level profit targets.
-        levels = st.entry_levels
-        booked = st.booked_lots
+        if st.mode == "simple":
+            if (
+                "simple" not in st.booked_levels
+                and st.average_entry > 0
+                and combined >= st.average_entry * 2
+            ):
+                lots = max(1, st.lots // 2)
+                return "profit_half", min(lots, remaining), "simple"
+            return None
 
-        # Level-1 (50) entry: book 1 lot when premium reaches ~100 (double).
-        if "50" in levels and booked < 1 and combined >= PT_LEVEL1_DOUBLE:
-            return "profit_level1"
-
-        # Level-2 (30) entry: book half (2 lots) at 65-70 zone.
-        if "30" in levels and booked < 3 and PT_LEVEL2_ZONE_LOW <= combined <= PT_LEVEL2_ZONE_HIGH:
-            return "profit_level2"
-
-        # Level-3 (20) entry: book half (3 lots) at ~45.
-        if "20" in levels and booked < 5 and combined >= PT_LEVEL3_ZONE:
-            return "profit_level3"
-
+        # Averaging mode: per-level profit targets, each booked once.
+        if (
+            "50" in st.entry_levels
+            and "50" not in st.booked_levels
+            and combined >= PT_LEVEL1_DOUBLE
+        ):
+            return "profit_level1", min(1, remaining), "50"
+        if (
+            "30" in st.entry_levels
+            and "30" not in st.booked_levels
+            and PT_LEVEL2_ZONE_LOW <= combined <= PT_LEVEL2_ZONE_HIGH
+        ):
+            return "profit_level2", min(2, remaining), "30"
+        if (
+            "20" in st.entry_levels
+            and "20" not in st.booked_levels
+            and combined >= PT_LEVEL3_ZONE
+        ):
+            return "profit_level3", min(3, remaining), "20"
         return None
 
+    def _book_lots(
+        self, now: datetime, reason: str, level: str, lots: int
+    ) -> None:
+        st = self._state
+        st.booked_lots += lots
+        if level not in st.booked_levels:
+            st.booked_levels.append(level)
+        st.last_action = "BOOK"
+        st.last_action_time = now
+        logger.info(
+            "Hedge 23: booked %d lot(s) at %s (%s), total booked=%d",
+            lots, level, reason, st.booked_lots,
+        )
+
+    def _close_position(self, now: datetime, reason: str) -> None:
+        """Fully close the position and clear the per-trade tracking state."""
+        st = self._state
+        st.entered = False
+        st.exit_sent = True
+        st.last_exit_reason = reason
+        st.last_action = "EXIT"
+        st.last_action_time = now
+        # Keep strike/symbols/last premiums for the snapshot, but clear the
+        # position-specific fields so the next entry starts cleanly.
+        st.lots = 0
+        st.entry_premiums = []
+        st.entry_levels = []
+        st.entry_lots = []
+        st.entry_times = []
+        st.average_entry = 0.0
+        st.booked_lots = 0
+        st.booked_levels = []
+        st.sl_price = 0.0
+        # Keep ``last_entry_time`` so the configured minimum gap also applies
+        # to a re-entry after an exit.
+        self._snapshot["status"] = "exited"
+        self._snapshot["position"] = self._position_snapshot()
+
     # -- position sizing ----------------------------------------------------
+    def _max_capital(self, settings: Settings) -> float:
+        return settings.hedge_23_capital * settings.hedge_23_max_capital_pct
+
+    def _invested(self, settings: Settings) -> float:
+        st = self._state
+        return sum(
+            premium * lots * settings.hedge_23_lot_size
+            for premium, lots in zip(
+                st.entry_premiums, st.entry_lots, strict=False
+            )
+        )
+
     def _position_size(self, settings: Settings, combined: float) -> int:
-        """Number of straddle lots (1 lot = 1 CE + 1 PE)."""
-        max_capital = settings.hedge_23_capital * settings.hedge_23_max_capital_pct
-        lot_size = settings.hedge_23_lot_size
-        cost_per_lot = combined * lot_size * 2  # CE + PE
+        """Number of straddle lots for a fresh entry (never breaches the cap).
+
+        One straddle lot costs ``combined * lot_size`` because the combined
+        premium already includes both the CE and the PE leg.
+        """
+        cost_per_lot = combined * settings.hedge_23_lot_size
         if cost_per_lot <= 0:
             return 0
-        lots = int(max_capital / cost_per_lot)
-        # Round down to nearest even number (for half-exit rule), min 2.
-        lots = (lots // 2) * 2
-        return max(lots, 2)
+        lots = int(self._max_capital(settings) / cost_per_lot)
+        # Round down to the nearest even number for the half-exit rule.
+        return (lots // 2) * 2
+
+    def _add_size(self, settings: Settings, combined: float) -> int:
+        """Lots available for an averaging add within the remaining cap."""
+        cost_per_lot = combined * settings.hedge_23_lot_size
+        if cost_per_lot <= 0:
+            return 0
+        remaining = max(0.0, self._max_capital(settings) - self._invested(settings))
+        fits = int(remaining / cost_per_lot)
+        lots = min(LOTS_PER_LEVEL, fits)
+        return (lots // 2) * 2
 
     # -- signal emission ----------------------------------------------------
     def _emit_entry(
@@ -449,14 +875,18 @@ class NiftyHedge23Strategy(Strategy):
             timestamp=now,
             price=combined,
             metadata={
-                "action": "ENTRY",
+                "action": "ADD" if len(st.entry_levels) > 1 else "ENTRY",
                 "mode": st.mode,
                 "expiry": st.expiry,
+                "expiry_kind": st.expiry_kind,
                 "strike": st.strike,
                 "ce_symbol": st.ce_symbol,
                 "pe_symbol": st.pe_symbol,
+                "ce_premium": st.last_ce_premium,
+                "pe_premium": st.last_pe_premium,
                 "combined_premium": combined,
                 "lots": lots,
+                "total_lots": st.lots,
                 "entry_level": entry_level,
                 "average_entry": st.average_entry,
                 "sl_price": st.sl_price,
@@ -465,36 +895,79 @@ class NiftyHedge23Strategy(Strategy):
             },
         )
 
+    def _emit_book(
+        self,
+        now: datetime,
+        reason: str,
+        level: str,
+        combined: float,
+        lots: int,
+        settings: Settings,
+    ) -> Signal:
+        st = self._state
+        pnl = round(
+            (combined - st.average_entry) * lots * settings.hedge_23_lot_size,
+            2,
+        )
+        return Signal(
+            symbol="NIFTY HEDGE 23",
+            strategy_name=self.metadata.name,
+            timestamp=now,
+            price=combined,
+            metadata={
+                "action": "BOOK",
+                "mode": st.mode,
+                "reason": reason,
+                "level": level,
+                "expiry": st.expiry,
+                "expiry_kind": st.expiry_kind,
+                "strike": st.strike,
+                "ce_symbol": st.ce_symbol,
+                "pe_symbol": st.pe_symbol,
+                "combined_premium": combined,
+                "lots_booked": lots,
+                "booked_lots": st.booked_lots + lots,
+                "remaining_lots": max(0, st.lots - st.booked_lots - lots),
+                "entry_average": st.average_entry,
+                "pnl_estimate": pnl,
+                "lot_size": settings.hedge_23_lot_size,
+            },
+        )
+
     def _emit_exit(
         self, now: datetime, reason: str, combined: float, settings: Settings,
     ) -> Signal:
         st = self._state
-        exit_price = combined
+        remaining = max(0, st.lots - st.booked_lots)
         pnl = None
-        if st.average_entry > 0 and exit_price > 0:
-            # Approximate P&L: (exit - entry) × lots × lot_size × 2 legs
+        if st.average_entry > 0 and combined > 0:
+            # (exit - average entry) x remaining lots x lot_size. The combined
+            # premium already covers both legs, so there is no x2 here.
             pnl = round(
-                (exit_price - st.average_entry) * st.lots * settings.hedge_23_lot_size * 2,
+                (combined - st.average_entry)
+                * remaining
+                * settings.hedge_23_lot_size,
                 2,
             )
         return Signal(
             symbol="NIFTY HEDGE 23",
             strategy_name=self.metadata.name,
             timestamp=now,
-            price=exit_price,
+            price=combined,
             metadata={
                 "action": "EXIT",
                 "mode": st.mode,
                 "reason": reason,
                 "expiry": st.expiry,
+                "expiry_kind": st.expiry_kind,
                 "strike": st.strike,
                 "ce_symbol": st.ce_symbol,
                 "pe_symbol": st.pe_symbol,
-                "combined_premium": exit_price,
+                "combined_premium": combined,
                 "entry_average": st.average_entry,
                 "lots": st.lots,
                 "booked_lots": st.booked_lots,
-                "remaining_lots": st.lots - st.booked_lots,
+                "remaining_lots": remaining,
                 "pnl_estimate": pnl,
                 "lot_size": settings.hedge_23_lot_size,
             },

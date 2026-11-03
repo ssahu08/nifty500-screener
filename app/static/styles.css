@@ -1504,3 +1504,214 @@ table.grid td.chg.muted {
   opacity: 0.6;
   cursor: wait;
 }
+
+/* -- Nifty Hedge 23 (expiry-day straddle, advisory only) ------------------ */
+.hedge-panel {
+  border-color: #23384a;
+}
+
+.hedge-status-pill {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.hedge-status-pill.ok {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+  background: rgba(53, 224, 161, 0.08);
+}
+
+.hedge-status-pill.warn {
+  color: var(--amber);
+  border-color: #453a1a;
+  background: rgba(245, 180, 69, 0.08);
+}
+
+.hedge-status-pill.danger {
+  color: var(--danger);
+  border-color: #4a241c;
+  background: rgba(240, 85, 63, 0.08);
+}
+
+.hedge-body {
+  padding: 14px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.hedge-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+}
+
+.hedge-stat {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.hedge-stat-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+.hedge-stat-value {
+  font-family: var(--font-mono);
+  font-size: 18px;
+  font-weight: 600;
+  margin-top: 3px;
+}
+
+.hedge-stat-value.accent {
+  color: var(--accent);
+}
+
+.hedge-stat-value.amber {
+  color: var(--amber);
+}
+
+.hedge-stat-value.danger {
+  color: var(--danger);
+}
+
+.hedge-stat-sub {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.hedge-tentative {
+  border: 1px solid var(--accent-dim);
+  border-radius: 8px;
+  padding: 12px 14px;
+  background: rgba(53, 224, 161, 0.05);
+}
+
+.hedge-tentative.waiting {
+  border-color: #453a1a;
+  background: rgba(245, 180, 69, 0.05);
+}
+
+.hedge-tentative h3 {
+  margin: 0 0 8px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--accent);
+}
+
+.hedge-tentative.waiting h3 {
+  color: var(--amber);
+}
+
+.hedge-legs {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.hedge-legs th,
+.hedge-legs td {
+  text-align: left;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.hedge-legs th {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.hedge-legs tr:last-child td {
+  border-bottom: none;
+}
+
+.hedge-legs .leg-symbol {
+  font-family: var(--font-mono);
+}
+
+.hedge-legs .leg-side {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.hedge-legs .leg-side.ce {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+
+.hedge-legs .leg-side.pe {
+  color: #6db3f2;
+  border-color: #24384d;
+}
+
+.hedge-note {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.hedge-note.warn {
+  color: var(--amber);
+}
+
+.hedge-note.danger {
+  color: var(--danger);
+}
+
+.hedge-footer {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.hedge-position {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.hedge-position-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.hedge-position-head strong {
+  color: var(--fg);
+  font-weight: 600;
+}

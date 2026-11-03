@@ -110,6 +110,31 @@ def strategy_history(
     return {"strategy": strategy_name, "days": days, "signals": rows}
 
 
+# -- Nifty Hedge 23 live snapshot -------------------------------------------
+@router.get("/hedge23/state")
+def hedge23_state(
+    request: Request,
+    refresh: bool = Query(default=True, description="Refetch quotes when stale"),
+) -> dict:
+    """Tentative strike, CE/PE legs and position state for Nifty Hedge 23.
+
+    Advisory only: this endpoint never places an order. The strategy refreshes
+    its own quotes at most once per minute, so the dashboard can poll freely.
+    """
+    strategy = request.app.state.registry.get("Nifty Hedge 23")
+    if strategy is None:
+        raise HTTPException(status_code=404, detail="Nifty Hedge 23 is not registered")
+    settings = request.app.state.settings
+    if refresh:
+        refresh_fn = getattr(strategy, "refresh_snapshot", None)
+        if refresh_fn is not None:
+            return refresh_fn(settings)
+    snapshot_fn = getattr(strategy, "snapshot", None)
+    if snapshot_fn is None:
+        raise HTTPException(status_code=404, detail="Snapshot not available")
+    return snapshot_fn()
+
+
 # -- manual trigger ---------------------------------------------------------
 @router.post("/run/{strategy_name}")
 def run_strategy(strategy_name: str, request: Request) -> dict:

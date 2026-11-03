@@ -290,6 +290,38 @@ equal the day's low price** - the stock never traded below its open.
 * Weekly/monthly historical variants were removed because they are not
   day-level signals.
 
+### Nifty Hedge 23 (expiry-day straddle, advisory only)
+
+`app.strategies.nifty_hedge_23.NiftyHedge23Strategy` (no candle universe, auto
+every 5 minutes). On a Nifty expiry day it buys an **ATM CE and ATM PE
+together** (a long straddle) and manages them as one position. It never places
+orders.
+
+* **Expiry detection**: Nifty weeklies normally expire on Tuesday, but an NSE
+  holiday shifts the expiry to the previous trading day (e.g. 9 Nov and 23 Nov
+  2026). `app/data/options.py` uses the shared holiday calendar
+  (`app/core/nse_holidays.json`) and the FYERS symbol formats verified against
+  the public symbol master: weekly `NSE:NIFTY{YY}{M}{DD}{STRIKE}{CE|PE}`
+  (e.g. `NSE:NIFTY26N0326000CE`) and monthly
+  `NSE:NIFTY{YY}{MMM}{STRIKE}{CE|PE}` (e.g. `NSE:NIFTY26NOV26000CE`).
+* **Simple mode** (default): enter once when the combined CE+PE premium is in
+  the **17-28** zone, after 13:00 IST. **Averaging mode**: scale in at 50, 30
+  and 20 (2 lots per level, max 6).
+* **Risk**: combined-premium stop at 10 (simple) / 8 (averaging); hard exit at
+  15:30. Book half when the premium doubles (simple) or at the per-level
+  targets (averaging), then trail the remainder.
+* **Sizing**: one straddle lot costs `combined_premium * lot_size` (the
+  combined premium already includes both legs). Total premium paid never
+  exceeds `hedge_23_capital * hedge_23_max_capital_pct` (default 5%). If fewer
+  than two lots fit, the entry is skipped instead of breaching the cap.
+* **Dashboard**: a dedicated panel shows the live Nifty spot, ATM strike, both
+  FYERS leg symbols and premiums, the combined premium, the entry zone, the
+  recommended lot count/cost, the stop loss and the current position. It is
+  populated before 13:00 (tentative strike) and refreshed at most once a
+  minute via `GET /api/hedge23/state`. The strategy card only shows signals
+  from the current expiry day, so a previous expiry's entry is never presented
+  as today's.
+
 ### Nifty 500 universe
 
 `app.strategies.universe.download_nifty_500()` fetches the constituent list

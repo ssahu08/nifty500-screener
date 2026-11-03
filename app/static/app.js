@@ -21,6 +21,10 @@ const refreshAdminBtn = document.getElementById("refresh-admin");
 const adminUpdated = document.getElementById("admin-updated");
 const overviewToggle = document.getElementById("overview-toggle");
 const overviewPanel = document.getElementById("overview-panel");
+const hedge23Body = document.getElementById("hedge23-body");
+const hedge23Status = document.getElementById("hedge23-status");
+const hedge23Updated = document.getElementById("hedge23-updated");
+const refreshHedge23Btn = document.getElementById("refresh-hedge23");
 
 const timeFmt = new Intl.DateTimeFormat("en-GB", {
   timeZone: IST,
@@ -99,6 +103,7 @@ const state = {
   modalName: null,
   subtabs: new Map(),
   minimizedRuns: new Set(),
+  hedge23: null,
 };
 
 const adminState = {
@@ -381,7 +386,11 @@ function scoreTooltip(meta) {
 
 function signalsTable(signals, name) {
   if (!signals.length) {
-    return '<div class="card-table"><div class="empty">No matches in the latest run.</div></div>';
+    const message =
+      name === "Nifty Hedge 23"
+        ? "No entry/exit signal today yet. The live tentative strike is in the Nifty Hedge 23 panel above."
+        : "No matches in the latest run.";
+    return `<div class="card-table"><div class="empty">${message}</div></div>`;
   }
   const hasScore = signals.some((s) => s.metadata && s.metadata.score != null);
   // Open-Equals-Low: expose the day open/low so the criterion is verifiable.
@@ -509,7 +518,17 @@ function historyTable(signals) {
 }
 
 function strategyCard(strategy) {
-  const allSignals = state.results.get(strategy.name) || [];
+  const isHedge23 = strategy.name === "Nifty Hedge 23";
+  let allSignals = state.results.get(strategy.name) || [];
+  // Hedge 23 is an expiry-day strategy: never show a previous expiry's
+  // entry/exit as if it were today's. The dedicated panel above carries the
+  // live tentative strike even when no signal has fired yet.
+  if (isHedge23) {
+    const today = state.hedge23 && state.hedge23.today;
+    if (today) {
+      allSignals = allSignals.filter((s) => String(s.signal_time || "").startsWith(today));
+    }
+  }
   // Banded strategies are actionable-only: never surface stale HOLD/SKIP
   // rows left in history by an older strategy version.
   const banded = allSignals.some((s) => (s.metadata || {}).band);
@@ -523,7 +542,13 @@ function strategyCard(strategy) {
       ? visibleSignals
       : visibleSignals.filter((s) => (s.metadata || {}).variant === activeSubtab);
   const count = signals.length;
-  const lastRun = allSignals.length ? fmtTime(allSignals[0].run_at) : "never run";
+  const lastRun = isHedge23
+    ? state.hedge23 && state.hedge23.updated_at
+      ? `snapshot ${fmtTime(state.hedge23.updated_at)}`
+      : "never run"
+    : allSignals.length
+      ? fmtTime(allSignals[0].run_at)
+      : "never run";
   const sched =
     strategy.schedule_type === "auto"
       ? strategy.run_at
@@ -591,6 +616,191 @@ async function loadResults() {
   state.results = new Map(results.map((r) => [r.strategy, r.signals]));
   resultsUpdated.textContent = `updated ${new Date().toLocaleTimeString("en-GB")}`;
   renderResults();
+}
+
+// -- Nifty Hedge 23 panel ---------------------------------------------------
+const HEDGE23_STATUS = {
+  not_started: ["not started", ""],
+  disabled: ["disabled", ""],
+  not_expiry_day: ["not expiry day", ""],
+  market_closed: ["market closed", ""],
+  waiting_entry_window: ["waiting · 13:00", "warn"],
+  waiting_zone: ["waiting for zone", "warn"],
+  entry_zone: ["entry zone", "ok"],
+  position_open: ["position open", "ok"],
+  exited: ["exited", ""],
+  data_unavailable: ["data unavailable", "danger"],
+};
+
+function fmtInr(value) {
+  return value == null || Number.isNaN(Number(value))
+    ? "—"
+    : `₹${numFmt.format(Number(value))}`;
+}
+
+function hedgeStat(label, value, { sub = "", tone = "" } = {}) {
+  return `<div class="hedge-stat">
+    <div class="hedge-stat-label">${escapeHtml(label)}</div>
+    <div class="hedge-stat-value${tone ? ` ${tone}` : ""}">${escapeHtml(value)}</div>
+    ${sub ? `<div class="hedge-stat-sub">${escapeHtml(sub)}</div>` : ""}
+  </div>`;
+}
+
+function renderHedge23(data) {
+  if (!hedge23Body) return;
+  state.hedge23 = data || null;
+  if (!data || data.status === "not_started") {
+    hedge23Status.textContent = "not started";
+    hedge23Status.className = "hedge-status-pill";
+    hedge23Updated.textContent = "waiting for the first scan";
+    hedge23Body.innerHTML =
+      '<div class="placeholder">The strategy has not produced a snapshot yet. It refreshes every 5 minutes during market hours.</div>';
+    return;
+  }
+
+  const [label, tone] = HEDGE23_STATUS[data.status] || [data.status || "unknown", ""];
+  hedge23Status.textContent = label;
+  hedge23Status.className = `hedge-status-pill${tone ? ` ${tone}` : ""}`;
+
+  const expiryText = data.expiry_label
+    ? `expiry ${data.expiry_label}${data.expiry_kind ? ` (${data.expiry_kind})` : ""}`
+    : "";
+  hedge23Updated.textContent = [
+    data.updated_at ? `updated ${fmtTime(data.updated_at)}` : "",
+    expiryText,
+    data.age_seconds != null ? `age ${Math.round(data.age_seconds)}s` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  const mode = data.mode || "simple";
+  const zone = data.entry_zone || {};
+  const pos = data.position || {};
+  const combined = data.combined_premium;
+  const inZone = Boolean(data.in_entry_zone);
+  const recommended = Number(data.recommended_lots || 0);
+  const sl = (data.sl || {})[mode];
+
+  const stats = [
+    hedgeStat("Nifty spot", data.spot != null ? numFmt.format(data.spot) : "—"),
+    hedgeStat("ATM strike", data.atm_strike ? numFmt.format(data.atm_strike) : "—", {
+      sub: "50-point step",
+    }),
+    hedgeStat("Combined CE+PE", combined != null ? fmtInr(combined) : "—", {
+      tone: inZone ? "accent" : "",
+      sub: inZone ? "inside entry zone" : "outside entry zone",
+    }),
+    hedgeStat("Entry zone", `${zone.low ?? "—"}–${zone.high ?? "—"}`, {
+      sub: `mid ${zone.mid ?? "—"}`,
+    }),
+    hedgeStat("Mode", mode, {
+      sub: mode === "averaging" ? "50-30-20 ladder" : "single entry",
+    }),
+    hedgeStat(
+      "Recommended",
+      recommended ? `${recommended} lot${recommended === 1 ? "" : "s"}` : "wait",
+      {
+        sub: recommended
+          ? fmtInr(data.recommended_cost)
+          : `1 lot ${fmtInr(data.cost_per_lot)}`,
+      }
+    ),
+  ].join("");
+
+  let legsHtml;
+  if (data.is_expiry_day && data.ce_symbol && data.pe_symbol) {
+    const heading = pos.open
+      ? "Open position"
+      : inZone
+        ? "Tentative buy — in entry zone"
+        : "Tentative strike — waiting for the zone";
+    const lotSize = data.lot_size ?? "—";
+    legsHtml = `<div class="hedge-tentative${inZone || pos.open ? "" : " waiting"}">
+      <h3>${escapeHtml(heading)}</h3>
+      <table class="hedge-legs">
+        <thead><tr><th>Leg</th><th>Fyers symbol</th><th>Premium</th><th>Qty / lot</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><span class="leg-side ce">CE</span></td>
+            <td class="leg-symbol">${escapeHtml(data.ce_symbol)}</td>
+            <td>${data.ce_premium != null ? fmtInr(data.ce_premium) : "—"}</td>
+            <td>${escapeHtml(lotSize)}</td>
+          </tr>
+          <tr>
+            <td><span class="leg-side pe">PE</span></td>
+            <td class="leg-symbol">${escapeHtml(data.pe_symbol)}</td>
+            <td>${data.pe_premium != null ? fmtInr(data.pe_premium) : "—"}</td>
+            <td>${escapeHtml(lotSize)}</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="hedge-note" style="margin-top:8px">
+        Buy both legs together as one straddle.
+        ${
+          recommended
+            ? `Recommended ${recommended} lot${recommended === 1 ? "" : "s"} ≈ ${fmtInr(data.recommended_cost)} at the current combined premium.`
+            : "No even lot fits the capital cap at this premium — wait or raise the configured capital."
+        }
+      </div>
+    </div>`;
+  } else if (!data.is_expiry_day) {
+    legsHtml = `<div class="hedge-note">Today is not a Nifty expiry day. Next expiry: <strong>${escapeHtml(data.expiry_label || "—")}</strong>.</div>`;
+  } else {
+    legsHtml = `<div class="hedge-note warn">Option quotes are unavailable right now. ${escapeHtml(
+      data.error || "The market may be closed or the Fyers token may have expired."
+    )}</div>`;
+  }
+
+  let positionHtml;
+  if (pos.open) {
+    positionHtml = `<div class="hedge-position">
+      <div class="hedge-position-head">
+        <strong>Position open</strong>
+        <span>${pos.lots} lot${pos.lots === 1 ? "" : "s"} · avg ${fmtInr(pos.average_entry)} · SL ${fmtInr(pos.sl_price)}</span>
+      </div>
+      <div class="hedge-note">
+        Levels: ${escapeHtml((pos.entry_levels || []).join(", ") || "—")} ·
+        booked ${pos.booked_lots || 0} · remaining ${pos.remaining_lots || 0}
+        ${data.next_action ? ` · next: ${escapeHtml(data.next_action)}${data.next_level ? ` (${escapeHtml(data.next_level)})` : ""}` : ""}
+      </div>
+    </div>`;
+  } else {
+    positionHtml = `<div class="hedge-position">
+      <div class="hedge-position-head">
+        <strong>No position</strong>
+        <span>next action: ${escapeHtml(data.next_action || "WAIT")}${data.next_level ? ` (${escapeHtml(data.next_level)})` : ""}</span>
+      </div>
+      <div class="hedge-note">
+        ${
+          data.note
+            ? escapeHtml(data.note)
+            : `Stop loss at combined ${fmtInr(sl)}. Entry window ${escapeHtml(data.entry_window || "13:00-15:30 IST")}.`
+        }
+      </div>
+    </div>`;
+  }
+
+  hedge23Body.innerHTML = `<div class="hedge-grid">${stats}</div>${legsHtml}${positionHtml}
+    <div class="hedge-footer">
+      <span>Capital ${fmtInr(data.capital)} · cap ${fmtInr(data.max_capital)} · ${escapeHtml(
+        data.lot_size ?? "—"
+      )}-share lot</span>
+      <span>${escapeHtml(data.advisory || "Advisory only.")}</span>
+    </div>`;
+}
+
+async function loadHedge23(force = false) {
+  if (!hedge23Body || pinGateVisible()) return;
+  try {
+    const data = await getJson(`/api/hedge23/state${force ? "?refresh=true" : ""}`);
+    renderHedge23(data);
+  } catch (err) {
+    if (err.pinRequired) return;
+    hedge23Status.textContent = "unavailable";
+    hedge23Status.className = "hedge-status-pill danger";
+    hedge23Updated.textContent = "";
+    hedge23Body.innerHTML = `<div class="placeholder">Hedge 23 snapshot unavailable — ${escapeHtml(err.message)}</div>`;
+  }
 }
 
 // -- admin console ----------------------------------------------------------
@@ -1173,8 +1383,18 @@ resultsEl.addEventListener("click", (event) => {
 
 document.getElementById("refresh-overview").addEventListener("click", () => loadOverview(true));
 
+if (refreshHedge23Btn) {
+  refreshHedge23Btn.addEventListener("click", () => loadHedge23(true));
+}
+
 document.getElementById("refresh-all").addEventListener("click", async () => {
-  await Promise.allSettled([checkHealth(), loadOverview(true), loadResults(), loadAdmin()]);
+  await Promise.allSettled([
+    checkHealth(),
+    loadOverview(true),
+    loadHedge23(true),
+    loadResults(),
+    loadAdmin(),
+  ]);
 });
 
 adminToggle.addEventListener("click", () => {
@@ -1213,6 +1433,7 @@ async function init() {
   }
   hidePinGate();
   await loadOverview();
+  await loadHedge23();
   await loadAdmin();
   try {
     await loadResults();
@@ -1225,6 +1446,7 @@ async function init() {
 
 init();
 setInterval(checkHealth, REFRESH_MS);
+setInterval(loadHedge23, REFRESH_MS);
 setInterval(loadResults, REFRESH_MS);
 setInterval(loadAdmin, REFRESH_MS);
 setInterval(updateMinimizedTimes, 1000);

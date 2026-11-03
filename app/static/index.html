@@ -13,7 +13,7 @@
     <meta name="apple-mobile-web-app-title" content="N500" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-    <link rel="stylesheet" href="/styles.css?v=15" />
+    <link rel="stylesheet" href="/styles.css?v=16" />
   </head>
   <body>
     <header class="topbar">
@@ -32,6 +32,23 @@
     </header>
 
     <main class="layout">
+      <!-- Nifty Hedge 23: expiry-day straddle, advisory only -->
+      <section class="panel hedge-panel" id="hedge23-panel" aria-labelledby="hedge23-title">
+        <div class="panel-head">
+          <div>
+            <h2 id="hedge23-title">Nifty Hedge 23 <span class="badge">expiry-day straddle</span></h2>
+            <span class="muted" id="hedge23-updated">loading…</span>
+          </div>
+          <div class="panel-tools">
+            <span class="hedge-status-pill" id="hedge23-status">—</span>
+            <button class="btn ghost sm" id="refresh-hedge23" title="Refetch option quotes">Refresh</button>
+          </div>
+        </div>
+        <div class="hedge-body" id="hedge23-body">
+          <div class="placeholder">Loading Hedge 23 snapshot…</div>
+        </div>
+      </section>
+
       <!-- Strategy Results stays as full-width panel -->
       <section class="panel" aria-labelledby="results-title">
         <div class="panel-head">
@@ -150,6 +167,6 @@
       </div>
     </div>
 
-    <script src="/app.js?v=26"></script>
+    <script src="/app.js?v=29"></script>
   </body>
 </html>

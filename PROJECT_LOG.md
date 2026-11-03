@@ -350,6 +350,36 @@ previous-session daily signals are not re-emitted by the 10-minute cadence.
 After the close (manual EOD run) the quote is the completed daily bar, so the
 daily list is reproduced exactly.
 
+## Nifty Hedge 23: expiry-day symbol and logic fixes (2026-11-03)
+
+**Symptom**: the strategy could not resolve FYERS option symbols and several
+position-management paths were wrong; the dashboard had no tentative strike.
+
+**Fixes**
+* `app/data/options.py`: correct FYERS weekly/monthly symbol formats,
+  holiday-shifted expiries (9 Nov / 23 Nov 2026), `is_nifty_expiry_day`,
+  `expiry_kind`, and safe same-date symbol candidates. Added
+  `app/core/nse_holidays.json` so `is_trading_day` skips NSE holidays.
+* `app/strategies/nifty_hedge_23.py`: fixed the market-close `_emit_exit`
+  argument error, enabled averaging adds (the old code compared float levels
+  to strings and returned early while a position was open), removed the
+  double-counted premium (`combined` already includes both legs) and the forced
+  minimum 2 lots beyond the capital cap, reset position state on re-entry, made
+  profit-taking a partial BOOK instead of a full exit, initialised the mode
+  from settings on the first scan, and added a thread-safe live
+  `snapshot()`/`refresh_snapshot()`.
+* `app/api/routes.py`: `GET /api/hedge23/state` (advisory-only snapshot,
+  throttled to one quote refresh per minute).
+* Dashboard: dedicated Hedge 23 panel with the tentative ATM strike, CE/PE
+  FYERS symbols, premiums, combined premium, entry zone, recommended lots/cost,
+  SL and position state; the strategy card hides previous-expiry signals.
+
+**Verified** (live, 3 Nov 2026 09:16 IST)
+* `/api/hedge23/state` resolved `NSE:NIFTY26N0323550CE/PE` (both present in the
+  FYERS NSE_FO master), spot 23,538.85, ATM 23,550, combined 132.30.
+* Manual run: 1.9 s, 0 new signals (combined far above the 17-28 zone).
+* Full suite: **295 passed**; `ruff check app tests` clean.
+
 ---
 
 *This document is intended to provide an independent AI reviewer with complete context, design rationale, confirmed results, and identified gaps so that further improvements or mistakes can be identified without ambiguity.*
