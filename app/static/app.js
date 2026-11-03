@@ -626,6 +626,7 @@ const HEDGE23_STATUS = {
   market_closed: ["market closed", ""],
   waiting_entry_window: ["waiting · 13:00", "warn"],
   waiting_zone: ["waiting for zone", "warn"],
+  range_bound_wait: ["waiting for trend", "warn"],
   entry_zone: ["entry zone", "ok"],
   position_open: ["position open", "ok"],
   exited: ["exited", ""],
@@ -676,22 +677,56 @@ function renderHedge23(data) {
   const mode = data.mode || "simple";
   const zone = data.entry_zone || {};
   const pos = data.position || {};
+  const movement = data.movement || {};
   const combined = data.combined_premium;
   const inZone = Boolean(data.in_entry_zone);
   const recommended = Number(data.recommended_lots || 0);
-  const sl = (data.sl || {})[mode];
+  const behaviour = data.nifty_behaviour || movement.behaviour || "—";
+  const bias = movement.bias || "—";
+  const dayRange = movement.day_range_pts;
+  const moveOpen = movement.move_from_open_pts;
+  const isTrending = movement.is_trending !== false;
+  const radius = Number(data.radius_pts || 0);
+  const ceStrike = data.ce_strike || data.atm_strike;
+  const peStrike = data.pe_strike || data.atm_strike;
+  const slPrice = data.sl_price;
+  const target1 = data.target_1;
+  const target2 = data.target_2;
+  const balanced = Boolean(data.legs_balanced);
+
+  const movementSub = [
+    bias !== "—" ? bias.toLowerCase() : "",
+    dayRange != null ? `range ${dayRange} pts` : "",
+    moveOpen != null ? `from open ${moveOpen >= 0 ? "+" : ""}${moveOpen}` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
 
   const stats = [
     hedgeStat("Nifty spot", data.spot != null ? numFmt.format(data.spot) : "—"),
-    hedgeStat("ATM strike", data.atm_strike ? numFmt.format(data.atm_strike) : "—", {
-      sub: "50-point step",
+    hedgeStat("Movement", behaviour, {
+      tone: !isTrending ? "amber" : inZone ? "accent" : "",
+      sub: movementSub || "expiry behaviour",
     }),
+    hedgeStat(
+      "ATM strike",
+      data.atm_strike ? numFmt.format(data.atm_strike) : "—",
+      { sub: radius ? `${radius}-pt radius` : "ATM (0-pt radius)" }
+    ),
     hedgeStat("Combined CE+PE", combined != null ? fmtInr(combined) : "—", {
       tone: inZone ? "accent" : "",
-      sub: inZone ? "inside entry zone" : "outside entry zone",
+      sub: inZone
+        ? balanced
+          ? "inside entry zone · legs balanced"
+          : "inside entry zone · legs unbalanced"
+        : "outside entry zone",
     }),
     hedgeStat("Entry zone", `${zone.low ?? "—"}–${zone.high ?? "—"}`, {
-      sub: `mid ${zone.mid ?? "—"}`,
+      sub: `extended ${zone.extended_low ?? "—"}–${zone.extended_high ?? "—"}`,
+    }),
+    hedgeStat("Stop / targets", slPrice != null ? fmtInr(slPrice) : "—", {
+      tone: "amber",
+      sub: `T1 ${fmtInr(target1)} · T2 ${fmtInr(target2)}`,
     }),
     hedgeStat("Mode", mode, {
       sub: mode === "averaging" ? "50-30-20 ladder" : "single entry",
@@ -711,23 +746,27 @@ function renderHedge23(data) {
   if (data.is_expiry_day && data.ce_symbol && data.pe_symbol) {
     const heading = pos.open
       ? "Open position"
-      : inZone
-        ? "Tentative buy — in entry zone"
-        : "Tentative strike — waiting for the zone";
+      : !isTrending
+        ? "Tentative strike — Nifty range-bound"
+        : inZone
+          ? "Tentative buy — in entry zone"
+          : "Tentative strike — waiting for the zone";
     const lotSize = data.lot_size ?? "—";
     legsHtml = `<div class="hedge-tentative${inZone || pos.open ? "" : " waiting"}">
       <h3>${escapeHtml(heading)}</h3>
       <table class="hedge-legs">
-        <thead><tr><th>Leg</th><th>Fyers symbol</th><th>Premium</th><th>Qty / lot</th></tr></thead>
+        <thead><tr><th>Leg</th><th>Strike</th><th>Fyers symbol</th><th>Premium</th><th>Qty / lot</th></tr></thead>
         <tbody>
           <tr>
             <td><span class="leg-side ce">CE</span></td>
+            <td>${fmtPrice(ceStrike)}</td>
             <td class="leg-symbol">${escapeHtml(data.ce_symbol)}</td>
             <td>${data.ce_premium != null ? fmtInr(data.ce_premium) : "—"}</td>
             <td>${escapeHtml(lotSize)}</td>
           </tr>
           <tr>
             <td><span class="leg-side pe">PE</span></td>
+            <td>${fmtPrice(peStrike)}</td>
             <td class="leg-symbol">${escapeHtml(data.pe_symbol)}</td>
             <td>${data.pe_premium != null ? fmtInr(data.pe_premium) : "—"}</td>
             <td>${escapeHtml(lotSize)}</td>
@@ -735,13 +774,23 @@ function renderHedge23(data) {
         </tbody>
       </table>
       <div class="hedge-note" style="margin-top:8px">
-        Buy both legs together as one straddle.
+        Buy both legs together as one ${radius ? `${radius}-pt radius strangle` : "ATM straddle"}.
         ${
           recommended
             ? `Recommended ${recommended} lot${recommended === 1 ? "" : "s"} ≈ ${fmtInr(data.recommended_cost)} at the current combined premium.`
             : "No even lot fits the capital cap at this premium — wait or raise the configured capital."
         }
       </div>
+      ${
+        !balanced
+          ? '<div class="hedge-note warn" style="margin-top:6px">CE and PE premiums are not balanced (needs within 15 pts or ≤ 2.2x) — entry is skipped until they balance.</div>'
+          : ""
+      }
+      ${
+        !isTrending
+          ? `<div class="hedge-note warn" style="margin-top:6px">Nifty is ${escapeHtml(behaviour)}; the strategy waits for a trending move or an afternoon compression coil before entry.</div>`
+          : ""
+      }
     </div>`;
   } else if (!data.is_expiry_day) {
     legsHtml = `<div class="hedge-note">Today is not a Nifty expiry day. Next expiry: <strong>${escapeHtml(data.expiry_label || "—")}</strong>.</div>`;
@@ -756,10 +805,11 @@ function renderHedge23(data) {
     positionHtml = `<div class="hedge-position">
       <div class="hedge-position-head">
         <strong>Position open</strong>
-        <span>${pos.lots} lot${pos.lots === 1 ? "" : "s"} · avg ${fmtInr(pos.average_entry)} · SL ${fmtInr(pos.sl_price)}</span>
+        <span>${pos.lots} lot${pos.lots === 1 ? "" : "s"} · avg ${fmtInr(pos.average_entry)} · SL ${fmtInr(pos.sl_price)} · T1 ${fmtInr(pos.target_1)} · T2 ${fmtInr(pos.target_2)}</span>
       </div>
       <div class="hedge-note">
-        Levels: ${escapeHtml((pos.entry_levels || []).join(", ") || "—")} ·
+        CE ${fmtPrice(pos.ce_strike)} / PE ${fmtPrice(pos.pe_strike)} · ${pos.radius_pts || 0}-pt radius ·
+        levels: ${escapeHtml((pos.entry_levels || []).join(", ") || "—")} ·
         booked ${pos.booked_lots || 0} · remaining ${pos.remaining_lots || 0}
         ${data.next_action ? ` · next: ${escapeHtml(data.next_action)}${data.next_level ? ` (${escapeHtml(data.next_level)})` : ""}` : ""}
       </div>
@@ -774,7 +824,7 @@ function renderHedge23(data) {
         ${
           data.note
             ? escapeHtml(data.note)
-            : `Stop loss at combined ${fmtInr(sl)}. Entry window ${escapeHtml(data.entry_window || "13:00-15:30 IST")}.`
+            : `Stop loss ${fmtInr(slPrice)} · T1 ${fmtInr(target1)} · T2 ${fmtInr(target2)} · entry window ${escapeHtml(data.entry_window || "13:00-15:30 IST")}.`
         }
       </div>
     </div>`;

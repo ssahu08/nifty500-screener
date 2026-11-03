@@ -380,6 +380,59 @@ position-management paths were wrong; the dashboard had no tentative strike.
 * Manual run: 1.9 s, 0 new signals (combined far above the 17-28 zone).
 * Full suite: **295 passed**; `ruff check app tests` clean.
 
+## Nifty Hedge 23: trending straddle logic, radius strikes and targets (2026-11-03)
+
+**Change**: replaced the plain ATM straddle entry with the supplied
+NK Stock Talk "Nifty Hedge 23" trending straddle/strangle logic. Still
+advisory only - the screener never places orders.
+
+**New logic**
+* **Nifty movement gate** (`classify_nifty_movement`): classifies the expiry
+  session from Nifty 50 10-minute candles as `TRENDING_BULLISH`,
+  `TRENDING_BEARISH`, `COILED_FOR_SURGE` or `RANGE_BOUND_CHOP` using the day
+  range (>= 60 pts), directional efficiency (>= 0.25) and the EMA9/EMA21
+  spread (>= 10 pts); a compression coil after a morning move is allowed.
+  Entry is skipped while Nifty is range-bound chop. Before enough 10-minute
+  bars exist, the spot quote OHLC is used as a fallback; with no OHLC at all
+  the gate allows the trade (`TRENDING_READY`).
+* **Radius strike selection**: one batched quote request evaluates the
+  50-point radius (spot +50 CE / spot -50 PE), the 100-point radius and ATM,
+  preferring 50 -> 100 -> ATM. A pair is eligible only when CE/PE premiums are
+  balanced (within 15 pts or <= 2.2x) and the combined premium sits inside an
+  active entry zone; otherwise it falls back to ATM.
+* **Entry zones**: classic 17-28 (SL 10) and extended 35-55 (ideal 40-50,
+  SL 18); averaging mode still ladders 50/30/20.
+* **Targets and time stop**: `target_1` = 2x combined premium (book half),
+  `target_2` = 2.5x (or 110+ on the extended zone) to close the runner, and a
+  **14:35 IST time-based stop** when Nifty turns range-bound and the combined
+  premium has decayed >= 20% from the average entry. Hard exit stays 15:30.
+* **Snapshot/Signals**: both now expose `movement`/`nifty_behaviour`,
+  `ce_strike`/`pe_strike`/`radius_pts`, `legs_balanced`, `sl_price`,
+  `target_1` and `target_2`. The dashboard mirrors the movement gate with a
+  `range_bound_wait` status so it never advertises an entry during dead chop.
+
+**Integration notes**
+* `metadata.timeframes = ["10m"]` and `get_universe()` returns
+  `NSE:NIFTY50-INDEX`, so the scheduler shares the Nifty 10-minute candles
+  already fetched for the run. Verified FYERS returns 152 rows for that symbol.
+* Snapshot `refresh_snapshot()` still uses quote OHLC (it does not run inside
+  the scheduler), so the dashboard shows a quote-based classification; the
+  authoritative 10-minute classification is computed during `scan()`.
+* Once a position is open, `_fetch_leg_data()` fetches the **entered** CE/PE
+  symbols instead of re-selecting a radius, so the dashboard, stop-loss and
+  target checks never drift to strikes that were not bought.
+* Tests expanded to 25 Hedge 23 cases: synthetic trending/chop/coiled 10-minute
+  frames, extended-zone entry, 50/100 radius selection, leg-balance rejection,
+  movement gate, time SL, target-2 exit, snapshot fields and open-position
+  strike stability when spot moves.
+
+**Verified**
+* Full suite: **308 passed, 1 warning**; `ruff check app tests` clean.
+* Dashboard renders the new movement/radius/targets panel with no console
+  errors; after-hours state correctly reports `market_closed`.
+* Live intraday validation of the movement gate was not possible at 17:57 IST
+  (market closed); the next expiry is Monday 9 Nov 2026 (10 Nov holiday-shifted).
+
 ---
 
 *This document is intended to provide an independent AI reviewer with complete context, design rationale, confirmed results, and identified gaps so that further improvements or mistakes can be identified without ambiguity.*

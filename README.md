@@ -290,12 +290,11 @@ equal the day's low price** - the stock never traded below its open.
 * Weekly/monthly historical variants were removed because they are not
   day-level signals.
 
-### Nifty Hedge 23 (expiry-day straddle, advisory only)
+### Nifty Hedge 23 (expiry-day trending straddle/strangle, advisory only)
 
-`app.strategies.nifty_hedge_23.NiftyHedge23Strategy` (no candle universe, auto
-every 5 minutes). On a Nifty expiry day it buys an **ATM CE and ATM PE
-together** (a long straddle) and manages them as one position. It never places
-orders.
+`app.strategies.nifty_hedge_23.NiftyHedge23Strategy` (Nifty spot 10-minute
+candles, auto every 5 minutes). On a Nifty expiry day it buys a **CE and PE
+together** and manages them as one position. It never places orders.
 
 * **Expiry detection**: Nifty weeklies normally expire on Tuesday, but an NSE
   holiday shifts the expiry to the previous trading day (e.g. 9 Nov and 23 Nov
@@ -304,20 +303,34 @@ orders.
   the public symbol master: weekly `NSE:NIFTY{YY}{M}{DD}{STRIKE}{CE|PE}`
   (e.g. `NSE:NIFTY26N0326000CE`) and monthly
   `NSE:NIFTY{YY}{MMM}{STRIKE}{CE|PE}` (e.g. `NSE:NIFTY26NOV26000CE`).
-* **Simple mode** (default): enter once when the combined CE+PE premium is in
-  the **17-28** zone, after 13:00 IST. **Averaging mode**: scale in at 50, 30
-  and 20 (2 lots per level, max 6).
-* **Risk**: combined-premium stop at 10 (simple) / 8 (averaging); hard exit at
-  15:30. Book half when the premium doubles (simple) or at the per-level
-  targets (averaging), then trail the remainder.
+* **Nifty movement gate**: the strategy fetches Nifty 50 10-minute candles and
+  classifies the session as `TRENDING_BULLISH`, `TRENDING_BEARISH`,
+  `COILED_FOR_SURGE` or `RANGE_BOUND_CHOP` (day range, directional efficiency
+  and EMA9/EMA21 spread). It only enters when Nifty is trending or coiled after
+  a morning impulse, and skips dead range-bound chop. A quote-OHLC fallback is
+  used before enough 10-minute bars exist.
+* **Strike selection**: evaluates the **50-point radius** (spot +50 CE /
+  spot -50 PE), the **100-point radius** (spot +100 CE / spot -100 PE) and ATM,
+  in one batched quote request. A pair is eligible only when CE and PE premiums
+  are balanced (within 15 points or <= 2.2x ratio) and the combined premium is
+  inside an active entry zone; otherwise it falls back to ATM.
+* **Entry zones**: classic **17-28** combined (SL 10) and the updated 75-lot
+  **35-55** combined (ideal 40-50, SL 18). **Averaging mode** scales in at 50,
+  30 and 20 (2 lots per level, max 6).
+* **Risk and targets**: combined-premium stop at 10 (classic) / 18 (extended) /
+  8 (averaging), plus a **14:35 IST time-based stop** if Nifty turns
+  range-bound and the combined premium has decayed >= 20% from the average
+  entry. Target 1 is **2x** (book half), Target 2 is **2.5x** (or 110+ on the
+  extended zone) and closes the runner. Hard exit at 15:30.
 * **Sizing**: one straddle lot costs `combined_premium * lot_size` (the
   combined premium already includes both legs). Total premium paid never
   exceeds `hedge_23_capital * hedge_23_max_capital_pct` (default 5%). If fewer
   than two lots fit, the entry is skipped instead of breaching the cap.
-* **Dashboard**: a dedicated panel shows the live Nifty spot, ATM strike, both
-  FYERS leg symbols and premiums, the combined premium, the entry zone, the
-  recommended lot count/cost, the stop loss and the current position. It is
-  populated before 13:00 (tentative strike) and refreshed at most once a
+* **Dashboard**: a dedicated panel shows the live Nifty spot, movement
+  behaviour/bias/day range, ATM strike, selected CE/PE strikes and radius, both
+  FYERS leg symbols and premiums, the combined premium, leg balance, both entry
+  zones, stop/targets, recommended lot count/cost and the current position. It
+  is populated before 13:00 (tentative strike) and refreshed at most once a
   minute via `GET /api/hedge23/state`. The strategy card only shows signals
   from the current expiry day, so a previous expiry's entry is never presented
   as today's.
