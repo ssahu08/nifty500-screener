@@ -498,4 +498,52 @@ advisory only - the screener never places orders.
 
 ---
 
+## 12. OEL First-Candle Split and Hedge 23 Window — 2026-11-04
+
+### Open-Equals-Low
+* **Schedule**: `run_at="09:25"` plus `extra_run_at=["15:35"]`, with
+  `frequency_minutes=None`. OEL no longer runs every 10 minutes.
+* **09:25 first-candle scan**: evaluates only the completed 09:15-09:25 bar.
+  The gate is `first.open == first.low`; later bars do not invalidate it. The
+  signal is stamped at 09:15 and reports that candle's own OHLC/move.
+  `MIN_INTRADAY_BARS = 6` and the day-wide minimum-low check were removed.
+* **15:35 EOD scan**: daily, weekly and monthly variants run after the close,
+  exactly as before. The weekly/monthly period cache is refreshed only by this
+  slot, so an empty 09:25 scan can never suppress it.
+* **Per-slot fetch**: new `Strategy.required_timeframes(now)` hook; OEL returns
+  `["10m"]` before 15:15 and `["daily"]` after. The scheduler unions these, so
+  the 09:25 run does not pay for a full-universe daily fetch.
+* **Prefilter**: the 09:25 slot uses the quote gate only; the higher-timeframe
+  full-universe refresh is deferred to 15:35.
+
+### Nifty Hedge 23
+* **Schedule**: `frequency_minutes=10` (was 5), still `schedule_type="auto"`.
+* **Auto-run window**: new `Strategy.auto_run_allowed(now)` hook; the scheduler
+  checks it before any fetch. Hedge returns
+  `is_nifty_expiry_day(now.date()) and now.time() >= ENTRY_START` (13:00 IST),
+  so non-expiry days and the morning session cost zero API calls. The helper
+  also covers holiday-shifted expiries (normally Tuesday, occasionally Monday).
+
+### Scheduler / data path
+* **Multiple daily slots**: `StrategyMetadata.extra_run_at` plus a per-slot
+  `_last_daily_run[(name, "HH:MM")]` map. `_execute` carries the slot so the
+  completion timestamp is recorded against the right slot. Existing single-slot
+  strategies are unchanged.
+* **Intraday cache freshness**: `FyersProvider.get_candles` now refetches the
+  current-day tail on every in-session intraday call and merges it over the
+  cache. Previously the date-granular cache returned the first fetch of the day
+  for the rest of the session (e.g. a 10m frame frozen at 09:35), which made a
+  10-minute Hedge cadence meaningless. After the 15:30 close the cache is
+  treated as final, so no extra calls are made.
+* **API/dashboard**: `/api/strategies` exposes `extra_run_at`; the strategy card
+  shows both daily slots.
+
+### Verified
+* Full suite: **325 passed, 1 warning**; `ruff check app tests` clean.
+* Live `/api/strategies`: OEL `run_at=09:25`, `extra_run_at=['15:35']`,
+  `frequency_minutes=None`; Hedge 23 `frequency_minutes=10`.
+* No order endpoints were added or called; both strategies remain advisory.
+
+---
+
 *This document is intended to provide an independent AI reviewer with complete context, design rationale, confirmed results, and identified gaps so that further improvements or mistakes can be identified without ambiguity.*

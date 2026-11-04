@@ -5,15 +5,14 @@ never traded below the open during the session, so buyers were in control from
 the very first trade (e.g. LENSKART 28/10: the day opened at its low after a
 gap-down and rallied for the rest of the session).
 
-Four variants (all auto):
+Four variants, split across two daily runs:
 
-* **Intraday (10-minute)** - today's session so far: the 09:15 candle's open
-  must still be the lowest price across every completed 10-minute bar.
-  Evaluated only after one hour of trading (10:15 IST), because at 09:25 the
-  day's low is trivially the open for almost every stock. Once the continuous
-  session ends, the completed daily candle takes over.
-* **Daily (EOD)** - the most recent COMPLETED daily candle: open == low.
-  One signal per symbol per completed candle.
+* **First candle (10-minute)** - runs once at 09:25, after the 09:15-09:25
+  candle has completed. The signal is that first candle's open == low: price
+  never traded below the open during the opening bar. This is a first-candle
+  candidate, so a later dip below the open does not invalidate it.
+* **Daily (EOD)** - runs at 15:35 on the most recent COMPLETED daily candle:
+  open == low. One signal per symbol per completed candle.
 * **Weekly** - the last completed weekly candle before the current week:
   open == low. Built by resampling the daily frame to ``W-FRI``.
 * **Monthly** - the last completed monthly candle before the current month:
@@ -64,9 +63,6 @@ MARKET_OPEN = time(9, 15)
 
 VOLUME_THRESHOLD = 1.5
 MIN_MOVE_PCT = 0.5
-#: One hour of 10-minute bars before the day's low is meaningful. At 09:25 the
-#: first bar's low equals the open for almost every stock, which is noise.
-MIN_INTRADAY_BARS = 6
 #: Same-bar sessions used for the opening-volume comparison.
 VOLUME_LOOKBACK = 10
 #: Higher-timeframe resampling rules (daily -> weekly/monthly).
@@ -357,9 +353,22 @@ class OpenEqualsLowStrategy(Strategy):
             universe="NIFTY_500",
             schedule_type="auto",
             timeframes=["10m", "daily"],
-            frequency_minutes=10,
+            run_at="09:25",          # first 10m candle has just completed
+            extra_run_at=["15:35"],  # daily/weekly/monthly variants
             candle_interval="10m",
         )
+
+    def required_timeframes(self, now: datetime | None = None) -> list[str]:
+        """Only fetch what the current slot needs.
+
+        The 09:25 slot evaluates the opening 10-minute candle, so daily history
+        would add a full-universe fetch before the first signal. The 15:35 slot
+        evaluates daily/weekly/monthly candles and does not need 10m history.
+        """
+        now = now if now is not None else datetime.now(IST)
+        if getattr(now, "tzinfo", None) is None:
+            now = now.replace(tzinfo=IST)
+        return ["daily"] if now.time() >= CONTINUOUS_CLOSE else ["10m"]
 
     # -------------------------------------------------------------- prefilter
     def prefilter(
@@ -372,25 +381,38 @@ class OpenEqualsLowStrategy(Strategy):
         """Keep only symbols whose day open is still the day low.
 
         The batched quote already carries today's open and low, which is the
-        entire day-level OEL gate. Fetching 10-minute and daily history for all
-        ~500 symbols every 10 minutes otherwise burns the whole Fyers quota and
-        makes a scan take ~25 minutes. Symbols with a missing/incomplete quote
-        are kept so a data hiccup can never hide a signal.
+        entire OEL gate. Fetching 10-minute and daily history for all ~500
+        symbols otherwise burns the whole Fyers quota and makes a scan take
+        ~25 minutes. Symbols with a missing/incomplete quote are kept so a data
+        hiccup can never hide a signal.
 
-        When a new weekly/monthly period has completed, the higher-timeframe
-        cache is stale and daily candles are needed for the *whole* universe
+        At 09:25 the day's low *is* the opening candle's low, so the quote gate
+        is exactly the first-candle rule. The run is scheduled to start on
+        time; a much later catch-up run could miss a symbol whose first candle
+        matched but whose second candle traded lower.
+
+        At 15:35 the weekly/monthly cache may be stale when a new period has
+        completed, and daily candles are then needed for the *whole* universe
         (the quote gate only knows about today). In that case return the full
-        universe once; the next runs go back to the cheap quote prefilter.
+        universe once; later runs go back to the cheap quote prefilter.
         """
         now = now if now is not None else datetime.now(IST)
         if getattr(now, "tzinfo", None) is None:
             now = now.replace(tzinfo=IST)
 
+        if now.time() < CONTINUOUS_CLOSE:
+            # First-candle slot: the higher-timeframe refresh belongs to the
+            # 15:35 slot and must not force a full-universe 10m fetch here.
+            self._pending_keys = None
+            return self._quote_gated(quotes, settings)
+
         keys = self._htf_keys(now)
         self._pending_keys = keys
         if any(self._needs_refresh(variant, keys[variant]) for variant in keys):
             return self.get_universe(settings)
+        return self._quote_gated(quotes, settings)
 
+    def _quote_gated(self, quotes: dict[str, Quote], settings: Settings) -> list[str]:
         kept: list[str] = []
         for symbol in self.get_universe(settings):
             quote = quotes.get(normalize_symbol(symbol))
@@ -413,13 +435,26 @@ class OpenEqualsLowStrategy(Strategy):
         if getattr(now, "tzinfo", None) is None:
             now = now.replace(tzinfo=IST)
 
+        # The 09:25 slot fetches only 10m and the 15:35 slot only daily. Skip
+        # the higher-timeframe cache entirely when daily data was not fetched;
+        # otherwise an empty "refresh" at 09:25 would suppress the 15:35 run.
+        daily_available = any(
+            isinstance(frames, dict) and frames.get("daily") is not None
+            for frames in data.values()
+        )
+
         # Reuse the keys prefilter decided on so the fetch and the scan agree
         # even if the clock crosses a period boundary between the two calls.
         keys = self._pending_keys or self._htf_keys(now)
         self._pending_keys = None
-        refresh = {
-            variant: self._needs_refresh(variant, key) for variant, key in keys.items()
-        }
+        refresh = (
+            {
+                variant: self._needs_refresh(variant, key)
+                for variant, key in keys.items()
+            }
+            if daily_available
+            else {}
+        )
         fresh: dict[str, list[Signal]] = {
             variant: [] for variant, needed in refresh.items() if needed
         }
@@ -450,10 +485,11 @@ class OpenEqualsLowStrategy(Strategy):
         # Persist the freshly computed higher-timeframe signals for this period
         # and always re-emit them, so the day-level quote prefilter cannot hide
         # a completed weekly/monthly candle between runs.
-        for variant, needed in refresh.items():
-            if needed:
-                self._htf_cache[variant] = (keys[variant], fresh[variant])
-            signals.extend(self._htf_cache[variant][1])
+        if daily_available:
+            for variant, needed in refresh.items():
+                if needed:
+                    self._htf_cache[variant] = (keys[variant], fresh[variant])
+                signals.extend(self._htf_cache[variant][1])
 
         # Rank by quality: high opening volume first, thin matches last.
         signals.sort(
@@ -584,23 +620,19 @@ class OpenEqualsLowStrategy(Strategy):
         if first_ts_ist.time() != MARKET_OPEN:
             return None
 
-        # Wait for a meaningful sample: at 09:25 the day's low is trivially
-        # the open for almost every stock that ticked up in the first bar.
-        if len(today) < MIN_INTRADAY_BARS:
-            return None
-
-        # The actual criterion: the DAY's open must equal the DAY's low across
-        # every completed bar so far - not just the first candle's low.
+        # The signal is the FIRST candle only: its open must equal its low.
+        # Later bars are irrelevant - this is an opening-demand candidate, not
+        # a day-long "never traded below the open" filter.
         first = today.iloc[0]
         day_open = float(first["open"])
-        day_low = float(today["low"].min())
+        day_low = float(first["low"])
         if not _open_equals_low(day_open, day_low):
             return None
 
-        # Report the latest completed close and the move from the day's open,
-        # not the stale first-candle close/move.
-        ltp = float(today.iloc[-1]["close"])
-        day_high = float(today["high"].max())
+        # Report the first candle's own close/high so the signal is stable
+        # regardless of how late a catch-up run starts.
+        ltp = float(first["close"])
+        day_high = float(first["high"])
         move = _move_pct(day_open, ltp)
 
         profile = _volume_profile(ten_min, now.date())
@@ -635,7 +667,7 @@ class OpenEqualsLowStrategy(Strategy):
                 "day_high": round(day_high, 2),
                 "day_close": round(ltp, 2),
                 "ltp": round(ltp, 2),
-                "bars_elapsed": len(today),
+                "bars_elapsed": 1,
             },
         )
 

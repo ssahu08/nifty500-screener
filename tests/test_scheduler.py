@@ -265,7 +265,9 @@ def test_daily_not_due_after_window() -> None:
 
 def test_daily_runs_once_per_day() -> None:
     scheduler = _daily_scheduler()
-    scheduler._last_run["Daily"] = datetime(2026, 10, 16, 15, 25, tzinfo=IST)
+    scheduler._last_daily_run[("Daily", "15:20")] = datetime(
+        2026, 10, 16, 15, 25, tzinfo=IST
+    )
     assert not scheduler._is_daily_due(
         "Daily", "15:20", datetime(2026, 10, 16, 15, 30, tzinfo=IST)
     )
@@ -273,6 +275,91 @@ def test_daily_runs_once_per_day() -> None:
     assert scheduler._is_daily_due(
         "Daily", "15:20", datetime(2026, 10, 19, 15, 20, tzinfo=IST)
     )
+
+
+class _TwoSlotStrategy(Strategy):
+    @property
+    def metadata(self) -> StrategyMetadata:
+        return StrategyMetadata(
+            name="TwoSlot", description="two daily slots", category=Category.INTRADAY,
+            universe="NIFTY_50", schedule_type="auto",
+            timeframes=["10m", "daily"], run_at="09:25", extra_run_at=["15:35"],
+        )
+
+    def scan(self, data, settings):
+        return []
+
+
+class _FrozenDatetime(datetime):
+    """A ``datetime`` whose ``now`` is controlled by the test."""
+
+    current = datetime(2026, 10, 16, 9, 25, tzinfo=IST)
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls.current.astimezone(tz) if tz else cls.current
+
+
+def test_daily_slots_are_independent() -> None:
+    scheduler = StrategyScheduler(
+        _settings(), {"TwoSlot": _TwoSlotStrategy()}, _FakeProvider(), None
+    )
+    assert scheduler._daily_slots(scheduler.registry["TwoSlot"].metadata) == [
+        "09:25",
+        "15:35",
+    ]
+    now = datetime(2026, 10, 16, 9, 25, tzinfo=IST)
+    assert scheduler._is_daily_due("TwoSlot", "09:25", now)
+    scheduler._last_daily_run[("TwoSlot", "09:25")] = now
+    assert not scheduler._is_daily_due("TwoSlot", "09:25", now)
+    # The later slot is still due on the same day.
+    assert scheduler._is_daily_due(
+        "TwoSlot", "15:35", datetime(2026, 10, 16, 15, 35, tzinfo=IST)
+    )
+
+
+def test_tick_starts_each_daily_slot(monkeypatch) -> None:
+    import app.scheduler.jobs as jobs
+
+    scheduler = StrategyScheduler(
+        _settings(), {"TwoSlot": _TwoSlotStrategy()}, _FakeProvider(), None
+    )
+    calls: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(
+        scheduler,
+        "_start_async",
+        lambda name, slot=None: calls.append((name, slot)) or True,
+    )
+    monkeypatch.setattr(jobs, "datetime", _FrozenDatetime)
+
+    _FrozenDatetime.current = datetime(2026, 10, 16, 9, 25, tzinfo=IST)
+    scheduler.tick()
+    _FrozenDatetime.current = datetime(2026, 10, 16, 15, 35, tzinfo=IST)
+    scheduler.tick()
+
+    assert calls == [("TwoSlot", "09:25"), ("TwoSlot", "15:35")]
+
+
+def test_tick_respects_auto_run_allowed(monkeypatch) -> None:
+    import app.scheduler.jobs as jobs
+
+    class _Closed(_TwoSlotStrategy):
+        def auto_run_allowed(self, now=None):
+            return False
+
+    scheduler = StrategyScheduler(
+        _settings(), {"TwoSlot": _Closed()}, _FakeProvider(), None
+    )
+    calls: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(
+        scheduler,
+        "_start_async",
+        lambda name, slot=None: calls.append((name, slot)) or True,
+    )
+    monkeypatch.setattr(jobs, "datetime", _FrozenDatetime)
+    _FrozenDatetime.current = datetime(2026, 10, 16, 9, 25, tzinfo=IST)
+    scheduler.tick()
+    assert calls == []
 
 
 def test_daily_skips_weekends() -> None:

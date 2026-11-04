@@ -30,7 +30,9 @@ class StrategyMetadata:
 
     ``run_at`` ("HH:MM", IST) marks a daily-scheduled strategy: the auto-tick
     runs it once per trading day at that time instead of every
-    ``frequency_minutes``.
+    ``frequency_minutes``. ``extra_run_at`` adds further daily slots (for
+    strategies that need a different scan at a different time of day, e.g.
+    OEL's 09:25 first-candle check and 15:35 EOD variants).
     """
 
     name: str
@@ -42,6 +44,7 @@ class StrategyMetadata:
     frequency_minutes: int | None = None  # for interval auto strategies
     candle_interval: str | None = None  # primary interval (display)
     run_at: str | None = None  # "HH:MM" IST, for daily auto strategies
+    extra_run_at: list[str] = field(default_factory=list)  # more daily slots
 
 
 @dataclass
@@ -92,6 +95,24 @@ class Strategy(ABC):
         from app.strategies.universe import get_universe
 
         return get_universe(self.metadata.universe, settings)
+
+    def required_timeframes(self, now: datetime | None = None) -> list[str]:
+        """Candle intervals needed for a run at ``now``.
+
+        Defaults to every interval in :attr:`metadata`. Strategies with
+        time-of-day-dependent scans (e.g. OEL) override this so the scheduler
+        fetches only what that slot needs.
+        """
+        return list(self.metadata.timeframes or ["daily"])
+
+    def auto_run_allowed(self, now: datetime | None = None) -> bool:
+        """Whether the auto-tick may start this strategy at ``now``.
+
+        Defaults to ``True``. Strategies with a narrow operating window (e.g.
+        Nifty Hedge 23 on expiry days after 13:00) override this so the
+        scheduler skips the run *before* any data is fetched.
+        """
+        return True
 
     def prefilter(self, quotes: dict[str, Quote], settings: Settings) -> list[str] | None:
         """Cheap first pass before candle history is fetched.

@@ -61,6 +61,10 @@ class StrategyScheduler:
         self.store = store
         self.scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
         self._last_run: dict[str, datetime] = {}
+        #: Daily slots already completed: (strategy name, "HH:MM") -> finish
+        #: time. A strategy may have more than one slot per day (``run_at`` plus
+        #: ``extra_run_at``), so a single per-name timestamp is not enough.
+        self._last_daily_run: dict[tuple[str, str], datetime] = {}
         #: Live run progress per strategy (`run_status` reads this; the
         #: dashboard polls it to animate what a manual run is doing).
         self.progress: dict[str, dict] = {}
@@ -110,9 +114,14 @@ class StrategyScheduler:
             meta = strategy.metadata
             if meta.schedule_type != "auto":
                 continue
-            if meta.run_at:
-                if self._is_daily_due(name, meta.run_at, now):
-                    self._start_async(name)
+            if not strategy.auto_run_allowed(now):
+                continue
+            slots = self._daily_slots(meta)
+            if slots:
+                for slot in slots:
+                    if self._is_daily_due(name, slot, now):
+                        self._start_async(name, slot=slot)
+                        break
                 continue
             if not is_market_open(now):
                 continue
@@ -183,8 +192,15 @@ class StrategyScheduler:
             return True
         return (now - last) >= timedelta(minutes=frequency_minutes)
 
+    @staticmethod
+    def _daily_slots(meta) -> list[str]:
+        """All daily run times for a strategy (``run_at`` then extras)."""
+        slots = [meta.run_at] if meta.run_at else []
+        slots.extend(meta.extra_run_at or [])
+        return slots
+
     def _is_daily_due(self, name: str, run_at: str, now: datetime) -> bool:
-        """True once per trading day when the clock reaches ``run_at`` (IST)."""
+        """True once per trading day per slot when the clock reaches ``run_at``."""
         if not is_trading_day(now.date()):
             return False
         try:
@@ -196,10 +212,10 @@ class StrategyScheduler:
         deadline = (datetime.combine(now.date(), run_time) + DAILY_RUN_WINDOW).time()
         if now.time() < run_time or now.time() > deadline:
             return False
-        last = self._last_run.get(name)
+        last = self._last_daily_run.get((name, run_at))
         return last is None or last.date() != now.date()
 
-    def _start_async(self, name: str) -> bool:
+    def _start_async(self, name: str, *, slot: str | None = None) -> bool:
         """Claim ``name`` and run it in a background thread (non-blocking tick)."""
         if not self._claim([name]):
             logger.info("Skipping %s: previous run still in progress", name)
@@ -207,7 +223,7 @@ class StrategyScheduler:
         thread = threading.Thread(
             target=self._execute,
             args=([name],),
-            kwargs={"manual": False},
+            kwargs={"manual": False, "slot": slot},
             name=f"strategy-run-{name}",
             daemon=True,
         )
@@ -242,14 +258,26 @@ class StrategyScheduler:
             return 0
         return self._execute(names, manual=manual)
 
-    def _execute(self, names: list[str], *, manual: bool = False) -> int:
+    def _execute(
+        self,
+        names: list[str],
+        *,
+        manual: bool = False,
+        slot: str | None = None,
+    ) -> int:
         """Fetch the due strategies' universes once and run each on shared data."""
         try:
-            return self._execute_inner(names, manual=manual)
+            return self._execute_inner(names, manual=manual, slot=slot)
         finally:
             self._release(names)
 
-    def _execute_inner(self, names: list[str], *, manual: bool = False) -> int:
+    def _execute_inner(
+        self,
+        names: list[str],
+        *,
+        manual: bool = False,
+        slot: str | None = None,
+    ) -> int:
         total = 0
         for name in names:
             self._progress_start(name, manual)
@@ -277,7 +305,10 @@ class StrategyScheduler:
                 new_signals = self.store.save_run(name, signals)
                 # Stamp completion, not start: a long scan must not make the
                 # next tick think the strategy is due again immediately.
-                self._last_run[name] = datetime.now(IST)
+                finished = datetime.now(IST)
+                self._last_run[name] = finished
+                if slot is not None:
+                    self._last_daily_run[(name, slot)] = finished
                 total += len(signals)
                 self._progress_finish(name, signals=len(signals), error=None)
                 if signals:
@@ -349,7 +380,7 @@ class StrategyScheduler:
                 symbols = self.registry[name].get_universe(self.settings)
             universe.update(symbols)
 
-        timeframes = self._required_timeframes(names)
+        timeframes = self._required_timeframes(names, now=datetime.now(IST))
         end = _today()
 
         ordered = sorted(universe)
@@ -367,13 +398,15 @@ class StrategyScheduler:
                 self._progress_update(name, stage="fetching", done=done, total=total_symbols)
         return data
 
-    def _required_timeframes(self, names: list[str]) -> list[str]:
+    def _required_timeframes(
+        self, names: list[str], *, now: datetime | None = None
+    ) -> list[str]:
         """Union of the candle intervals the given strategies need, ordered."""
         order = {"10m": 0, "1h": 1, "60m": 1, "daily": 2, "1d": 2}
         intervals = {
             tf
             for name in names
-            for tf in (self.registry[name].metadata.timeframes or ["daily"])
+            for tf in self.registry[name].required_timeframes(now)
         }
         if not intervals:
             return ["daily"]

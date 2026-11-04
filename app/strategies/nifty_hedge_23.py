@@ -333,12 +333,25 @@ class NiftyHedge23Strategy(Strategy):
             universe="NIFTY_HEDGE",
             schedule_type="auto",
             timeframes=["10m"],      # Nifty 10m candles for movement classification
-            frequency_minutes=5,
+            frequency_minutes=10,
         )
 
     def get_universe(self, settings: Settings) -> list[str]:
         """Include Nifty spot so the scheduler can share 10m Nifty candles."""
         return [NIFTY_SPOT_SYMBOL]
+
+    def auto_run_allowed(self, now: datetime | None = None) -> bool:
+        """Only run on Nifty expiry days, from 13:00 IST onwards.
+
+        The scheduler checks this before fetching data, so non-expiry days and
+        the morning session cost no API calls. ``is_nifty_expiry_day`` also
+        covers holiday-shifted expiries (normally Tuesdays, occasionally the
+        preceding Monday).
+        """
+        now = now if now is not None else datetime.now(IST)
+        if getattr(now, "tzinfo", None) is None:
+            now = now.replace(tzinfo=IST)
+        return is_nifty_expiry_day(now.date()) and now.time() >= ENTRY_START
 
     def prefilter(self, quotes, settings):  # type: ignore[override]
         """Not used - quotes are fetched directly inside scan()."""

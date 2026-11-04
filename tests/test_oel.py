@@ -150,6 +150,19 @@ def test_metadata() -> None:
     assert m.category == Category.INTRADAY
     assert m.schedule_type == "auto"
     assert m.timeframes == ["10m", "daily"]
+    assert m.frequency_minutes is None
+    assert m.run_at == "09:25"
+    assert m.extra_run_at == ["15:35"]
+
+
+def test_required_timeframes_follows_the_slot() -> None:
+    s = OpenEqualsLowStrategy()
+    assert s.required_timeframes(
+        pd.Timestamp("2026-01-15 09:25", tz="Asia/Kolkata").to_pydatetime()
+    ) == ["10m"]
+    assert s.required_timeframes(
+        pd.Timestamp("2026-01-15 15:35", tz="Asia/Kolkata").to_pydatetime()
+    ) == ["daily"]
 
 
 def test_is_open_equals_low_true() -> None:
@@ -259,11 +272,11 @@ def test_scan_is_idempotent_for_daily_eod() -> None:
 
 
 # ------------------------------------------------------------------ new tests
-def test_intraday_rejects_signal_when_price_later_dips_below_open() -> None:
-    """The criterion is the DAY's open == the DAY's low, not just the first bar.
+def test_intraday_keeps_signal_when_price_later_dips_below_open() -> None:
+    """The criterion is the FIRST candle's open == low.
 
-    AARTIIND 30/10: the first candle opened at its low, then the stock traded
-    below that open for the rest of the day - it must NOT be flagged.
+    A later dip below the opening price does not invalidate an opening-demand
+    candidate; the 09:25 run only knows the first candle.
     """
     s = OpenEqualsLowStrategy()
     idx = pd.date_range("2026-01-15 09:15", periods=8, freq="10min", tz="Asia/Kolkata")
@@ -282,11 +295,13 @@ def test_intraday_rejects_signal_when_price_later_dips_below_open() -> None:
         {"SBIN": {"10m": frame, "daily": _daily_frame()}}, _settings(), now=NOW_INTRADAY
     )
     intraday = [sig for sig in signals if sig.metadata["timeframe"] == "10m"]
-    assert intraday == []
+    assert len(intraday) == 1
+    assert intraday[0].metadata["day_low"] == 100.0
+    assert intraday[0].price == 103.0  # first candle close
 
 
-def test_intraday_uses_full_day_low_and_latest_close() -> None:
-    """A genuine OEL day: every later low stays at/above the open."""
+def test_intraday_uses_first_candle_ohlc() -> None:
+    """The signal is stamped and priced from the 09:15 candle, not later bars."""
     s = OpenEqualsLowStrategy()
     idx = pd.date_range("2026-01-15 09:15", periods=8, freq="10min", tz="Asia/Kolkata")
     rows = [
@@ -308,21 +323,24 @@ def test_intraday_uses_full_day_low_and_latest_close() -> None:
     sig = intraday[0]
     assert sig.metadata["day_open"] == 100.0
     assert sig.metadata["day_low"] == 100.0
-    assert sig.price == 110.0  # latest completed close, not first candle's 103
-    assert sig.metadata["move_pct"] == 10.0
-    assert sig.metadata["bars_elapsed"] == 8
+    assert sig.metadata["day_high"] == 105.0
+    assert sig.metadata["day_close"] == 103.0
+    assert sig.price == 103.0
+    assert sig.metadata["move_pct"] == 3.0
+    assert sig.metadata["bars_elapsed"] == 1
+    assert sig.timestamp == frame.index[0].to_pydatetime()
 
 
-def test_intraday_waits_for_one_hour_of_bars() -> None:
-    """At 09:55 (4 bars) the low is still trivially the open - wait until 10:15."""
+def test_intraday_fires_as_soon_as_first_candle_closes() -> None:
+    """No 09:20 signal (bar still open); the 09:25 run evaluates it."""
     s = OpenEqualsLowStrategy()
     data = {"SBIN": {"10m": _intraday_frame(30), "daily": _daily_frame()}}
     early = s.scan(
-        data, _settings(), now=pd.Timestamp("2026-01-15 09:55", tz="Asia/Kolkata")
+        data, _settings(), now=pd.Timestamp("2026-01-15 09:20", tz="Asia/Kolkata")
     )
     assert [x for x in early if x.metadata["timeframe"] == "10m"] == []
     ready = s.scan(
-        data, _settings(), now=pd.Timestamp("2026-01-15 10:15", tz="Asia/Kolkata")
+        data, _settings(), now=pd.Timestamp("2026-01-15 09:25", tz="Asia/Kolkata")
     )
     assert [x for x in ready if x.metadata["timeframe"] == "10m"]
 

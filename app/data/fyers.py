@@ -32,6 +32,7 @@ import requests
 
 from app.config import Settings
 from app.core.logging import get_logger
+from app.core.market import MARKET_CLOSE, MARKET_OPEN
 from app.data.cache import CandleCache
 from app.data.provider import MarketDataProvider, Quote, chunked, normalize_symbol
 from app.data.rate_limit import RateLimiter
@@ -67,6 +68,30 @@ RESOLUTION_TO_PANDAS = {
 }
 
 IST = timezone(timedelta(hours=5, minutes=30))
+
+#: Intraday intervals whose cached tail must be refreshed during the session.
+#: A cache is only date-granular, so without this a 10m frame fetched at 09:25
+#: would keep being served for the rest of the day.
+INTRADAY_MINUTES = {
+    "1m": 1,
+    "2m": 2,
+    "3m": 3,
+    "5m": 5,
+    "10m": 10,
+    "10min": 10,
+    "10-minute": 10,
+    "15m": 15,
+    "20m": 20,
+    "30m": 30,
+    "1h": 60,
+    "60m": 60,
+    "1hour": 60,
+}
+
+
+def _now_ist() -> datetime:
+    """Current IST time (indirection so tests can freeze the clock)."""
+    return datetime.now(IST)
 
 #: FYERS API v3 refresh-token grant endpoint (separate from the auth-code one).
 REFRESH_TOKEN_URL = "https://api-t1.fyers.in/api/v3/validate-refresh-token"
@@ -413,7 +438,14 @@ class FyersProvider(MarketDataProvider):
         start: date,
         end: date,
     ) -> pd.DataFrame:
-        """Fetch OHLCV candles, using the cache when it covers the range."""
+        """Fetch OHLCV candles, using the cache when it covers the range.
+
+        The on-disk cache is date-granular. For intraday intervals during the
+        session the current day's bars can change (and an early fetch can
+        capture a partial bar), so the tail is refetched on every in-session
+        call and merged over the cache. Without this a 10m cache written at
+        09:25 would freeze for the rest of the day.
+        """
         if isinstance(start, datetime):
             start = start.date()
         if isinstance(end, datetime):
@@ -423,14 +455,26 @@ class FyersProvider(MarketDataProvider):
         key = f"{norm}|{resolution}"
 
         cached = self.cache.get(key, start, end)
-        if cached is not None:
+        now = _now_ist()
+        refresh_tail = (
+            interval in INTRADAY_MINUTES
+            and end >= now.date()
+            and MARKET_OPEN <= now.time() <= MARKET_CLOSE
+        )
+
+        if cached is not None and not refresh_tail:
             return cached
+
+        fetch_start = start
+        if refresh_tail and cached is not None and not cached.empty:
+            # Only the current day's tail can change; history is already on disk.
+            fetch_start = cached.index[-1].date()
 
         request = {
             "symbol": norm,
             "resolution": resolution,
             "date_format": 1,
-            "range_from": start.isoformat(),
+            "range_from": fetch_start.isoformat(),
             "range_to": end.isoformat(),
             "cont_flag": 1,
         }
@@ -438,6 +482,14 @@ class FyersProvider(MarketDataProvider):
         df = self._parse_history(response, resolution)
         if df is not None and not df.empty:
             self.cache.put(key, df)
+
+        if refresh_tail:
+            merged = self.cache.get(key, start, end)
+            if merged is not None:
+                return merged
+            if cached is not None:
+                return cached
+
         if df is None:
             return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
         return df

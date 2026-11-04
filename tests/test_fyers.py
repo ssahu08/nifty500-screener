@@ -286,6 +286,81 @@ def test_get_candles_normalises_datetime_range(tmp_path) -> None:
     assert request["range_to"] == "2026-01-03"
 
 
+def _intraday_cache(cache, bars) -> None:
+    cache.put(
+        "NSE:SBIN-EQ|10",
+        pd.DataFrame(
+            {
+                "open": [100.0] * len(bars),
+                "high": [101.0] * len(bars),
+                "low": [99.0] * len(bars),
+                "close": [100.5] * len(bars),
+                "volume": [1.0] * len(bars),
+            },
+            index=pd.DatetimeIndex(bars),
+        ),
+    )
+
+
+def test_intraday_cache_refetches_tail_during_session(tmp_path, monkeypatch) -> None:
+    import app.data.fyers as fyers
+
+    today = date(2026, 1, 2)
+    cache = CandleCache(tmp_path)
+    _intraday_cache(
+        cache,
+        [
+            datetime(2025, 11, 1, 9, 15, tzinfo=IST),
+            datetime(2026, 1, 2, 9, 15, tzinfo=IST),
+        ],
+    )
+
+    fresh = datetime(2026, 1, 2, 9, 25, tzinfo=IST)
+    model = _FakeModel()
+    model.candles_payload = {
+        "s": "ok",
+        "candles": [[int(fresh.timestamp()), 100.0, 101.0, 100.0, 100.5, 2.0]],
+    }
+    provider = FyersProvider(
+        _settings(), authenticator=None, cache=cache, fyers_model=model
+    )
+    monkeypatch.setattr(
+        fyers, "_now_ist", lambda: datetime(2026, 1, 2, 9, 25, tzinfo=IST)
+    )
+
+    df = provider.get_candles("SBIN", "10m", date(2025, 12, 1), today)
+
+    assert len(model.history_calls) == 1
+    assert model.history_calls[0]["range_from"] == today.isoformat()
+    assert df.index[-1] == pd.Timestamp(fresh)
+
+
+def test_intraday_cache_is_final_after_close(tmp_path, monkeypatch) -> None:
+    import app.data.fyers as fyers
+
+    today = date(2026, 1, 2)
+    cache = CandleCache(tmp_path)
+    _intraday_cache(
+        cache,
+        [
+            datetime(2025, 11, 1, 9, 15, tzinfo=IST),
+            datetime(2026, 1, 2, 15, 5, tzinfo=IST),
+        ],
+    )
+    model = _FakeModel()
+    provider = FyersProvider(
+        _settings(), authenticator=None, cache=cache, fyers_model=model
+    )
+    monkeypatch.setattr(
+        fyers, "_now_ist", lambda: datetime(2026, 1, 2, 15, 35, tzinfo=IST)
+    )
+
+    df = provider.get_candles("SBIN", "10m", date(2025, 12, 1), today)
+
+    assert model.history_calls == []
+    assert len(df) == 1
+
+
 def test_get_quotes_batches_by_50(tmp_path) -> None:
     model = _FakeModel()
     provider = FyersProvider(

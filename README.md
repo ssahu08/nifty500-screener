@@ -257,16 +257,21 @@ would duplicate the 15:35 alerts.
 
 ### Open-Equals-Low
 
-`app.strategies.oel.OpenEqualsLowStrategy` (universe **Nifty 500**, auto every
-10 minutes, 10-min + daily). The rule is literal: the **open price must equal
-the low price** - the stock never traded below its open.
+`app.strategies.oel.OpenEqualsLowStrategy` (universe **Nifty 500**, auto at
+**09:25** and **15:35 IST**, 10-min + daily). The rule is literal: the **open
+price must equal the low price** - the stock never traded below its open.
 
-* **Live 10-minute variant**: uses the 09:15 candle's open and the minimum low
-  across *all* completed 10-minute bars so far today. It only starts after one
-  hour of trading (10:15 IST), because at 09:25 the first bar's low is
-  trivially the open for almost every stock. It stops at the 15:15 continuous
-  close so the EOD daily candle takes over.
-* **Daily EOD variant**: the last completed daily candle must have open == low.
+* **Two daily slots, two different scans**: at 09:25 only 10-minute history is
+  fetched and only the opening candle is evaluated; at 15:35 only daily history
+  is fetched and the daily/weekly/monthly variants run. The scheduler's
+  `required_timeframes(now)` hook makes each slot pay only for what it needs, so
+  the 09:25 first-candle signal is never delayed by a full-universe daily fetch.
+* **First-candle variant (09:25)**: after the 09:15-09:25 candle completes, its
+  **own open must equal its own low**. Later bars do not invalidate the signal:
+  this is an opening-demand candidate, not a day-long "never traded below the
+  open" filter. The signal is stamped at 09:15 and priced from that candle.
+* **Daily EOD variant (15:35)**: the last completed daily candle must have
+  open == low.
 * **Weekly and monthly variants**: the last **completed** weekly (`W-FRI`) or
   monthly (`ME`) candle before the current week/month must have open == low.
   Both are built by resampling the daily frame in memory - no extra API calls
@@ -278,22 +283,22 @@ the low price** - the stock never traded below its open.
   carry `week_open/low/high/close` or `month_open/low/high/close` plus
   `period_label`.
 * **Quote prefilter**: before any candle history is fetched, one batched quote
-  per symbol checks `open == low` (2-decimal match) on the live day. This is
-  exactly the same gate as the 10-minute variant (the quote's day low is the
-  minimum of today's bars) and, after the close, exactly the daily candle's
-  gate. Only matches - plus symbols with a missing/incomplete quote - get
-  10-minute and daily candles, which keeps a run to seconds instead of
-  ~25 minutes for all 501 symbols. Matches are never filtered out; they are
-  only ranked by the quality score below.
+  per symbol checks `open == low` (2-decimal match) on the live day. At 09:25
+  the quote's day low *is* the opening candle's low, so this is exactly the
+  first-candle gate; at 15:35 it is exactly the daily candle's gate. Only
+  matches - plus symbols with a missing/incomplete quote - get candle history,
+  which keeps a run to seconds instead of ~25 minutes for all 501 symbols.
+  Matches are never filtered out; they are only ranked by the quality score
+  below.
 * **Higher-timeframe refresh**: weekly/monthly signals are cached per completed
-  period label and re-emitted on every scan, so the day-level quote prefilter
-  cannot make them disappear between runs. When the period key advances (first
-  run of a new week/month), the prefilter returns the full universe once so
-  daily candles exist for every symbol; subsequent runs go back to the cheap
-  quote gate.
-* Price and `move_pct` are the latest completed close and the move from the
-  day's open (not stale first-candle values); the alert shows `open=... low=...`
-  so the criterion is verifiable.
+  period label and re-emitted on the 15:35 scan, so the day-level quote
+  prefilter cannot make them disappear between runs. When the period key
+  advances (first 15:35 run of a new week/month), the prefilter returns the full
+  universe once so daily candles exist for every symbol; subsequent runs go
+  back to the cheap quote gate.
+* The 09:25 signal reports the opening candle's own close/high/low and the move
+  from its open; the 15:35 daily signal reports the completed daily candle.
+  Both alerts show `open=... low=...` so the criterion is verifiable.
 * **Quality ranking (not a filter)**: every open == low match is kept, then
   sorted by a 0-100 score so strong opening demand is at the top and thin
   matches are at the bottom. **65%** of the score is the 09:15 10-minute bar's
@@ -312,9 +317,14 @@ the low price** - the stock never traded below its open.
 ### Nifty Hedge 23 (expiry-day trending straddle/strangle, advisory only)
 
 `app.strategies.nifty_hedge_23.NiftyHedge23Strategy` (Nifty spot 10-minute
-candles, auto every 5 minutes). On a Nifty expiry day it buys a **CE and PE
-together** and manages them as one position. It never places orders.
+candles, auto **every 10 minutes only on Nifty expiry days from 13:00 IST**).
+On a Nifty expiry day it buys a **CE and PE together** and manages them as one
+position. It never places orders.
 
+* **Auto-run window**: the scheduler calls `auto_run_allowed(now)` before
+  fetching any data, so on non-expiry days and before 13:00 the strategy costs
+  zero API calls. The 13:00 start is the earliest entry window (`ENTRY_START`);
+  the strategy's own scan keeps the same gate for manual runs.
 * **Expiry detection**: Nifty weeklies normally expire on Tuesday, but an NSE
   holiday shifts the expiry to the previous trading day (e.g. 9 Nov and 23 Nov
   2026). `app/data/options.py` uses the shared holiday calendar

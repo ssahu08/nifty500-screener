@@ -580,10 +580,13 @@ function strategyCard(strategy) {
     : allSignals.length
       ? fmtTime(allSignals[0].run_at)
       : "never run";
+  const dailySlots = strategy.run_at
+    ? [strategy.run_at, ...(strategy.extra_run_at || [])]
+    : [];
   const sched =
     strategy.schedule_type === "auto"
-      ? strategy.run_at
-        ? `daily · ${strategy.run_at}`
+      ? dailySlots.length
+        ? `daily · ${dailySlots.join(", ")}`
         : `auto · ${strategy.frequency_minutes || "?"}m`
       : "manual";
   const name = escapeHtml(strategy.name);

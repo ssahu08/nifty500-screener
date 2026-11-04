@@ -51,6 +51,7 @@ def list_strategies(request: Request) -> list[dict]:
             "schedule_type": s.metadata.schedule_type,
             "frequency_minutes": s.metadata.frequency_minutes,
             "run_at": s.metadata.run_at,
+            "extra_run_at": s.metadata.extra_run_at,
             "timeframes": s.metadata.timeframes,
         }
         for s in registry.values()

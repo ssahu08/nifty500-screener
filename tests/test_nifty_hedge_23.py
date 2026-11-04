@@ -631,3 +631,26 @@ def test_refresh_snapshot_fetches_live_quotes(clock) -> None:
     assert snap["status"] == "waiting_entry_window"
     assert snap["combined_premium"] == 21.4
     assert snap["recommended_lots"] == 2
+
+
+# -- auto schedule -----------------------------------------------------------
+def test_metadata_runs_every_10_minutes() -> None:
+    meta = NiftyHedge23Strategy().metadata
+    assert meta.schedule_type == "auto"
+    assert meta.frequency_minutes == 10
+
+
+def test_auto_run_allowed_only_on_expiry_day_after_1300() -> None:
+    strategy = NiftyHedge23Strategy()
+
+    # 3 Nov 2026 is a Nifty expiry Tuesday.
+    assert not strategy.auto_run_allowed(
+        datetime(2026, 11, 3, 12, 59, tzinfo=IST)
+    )
+    assert strategy.auto_run_allowed(datetime(2026, 11, 3, 13, 0, tzinfo=IST))
+    assert strategy.auto_run_allowed(datetime(2026, 11, 3, 15, 0, tzinfo=IST))
+
+    # 4 Nov is a Wednesday, not an expiry day.
+    assert not strategy.auto_run_allowed(
+        datetime(2026, 11, 4, 14, 0, tzinfo=IST)
+    )
