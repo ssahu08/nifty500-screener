@@ -135,9 +135,11 @@ class MultiTimeframeDojiStrategy(Strategy):
             ),
             category=Category.INTRADAY,
             universe="NIFTY_500",
-            schedule_type="auto",
+            # Paused on prod (2026-11-04): the full-universe 10-minute scan
+            # needs ~1,000 history calls and cannot keep up with a 10-minute
+            # cadence on the current FYERS plan. Manual/ad-hoc only for now.
+            schedule_type="manual",
             timeframes=["10m", "daily"],
-            frequency_minutes=10,
             candle_interval="10m",
         )
 

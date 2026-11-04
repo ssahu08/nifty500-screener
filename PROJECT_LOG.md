@@ -478,4 +478,24 @@ advisory only - the screener never places orders.
 
 ---
 
+## 11. Multi-Timeframe Doji Paused on Prod — 2026-11-04
+
+* **Changed** `MultiTimeframeDojiStrategy.metadata` from `schedule_type="auto"`
+  (10-minute tick) to `schedule_type="manual"`. The scheduler now skips it; the
+  dashboard still shows the card and its **Run now** button for ad-hoc runs.
+* **Why**: the strategy evaluates 10-minute and daily candles across all 501
+  Nifty 500 symbols. A cold full-universe fetch is ~1,000 FYERS history calls
+  and takes ~25 minutes at the 40/min internal limit, so it cannot sustain a
+  10-minute cadence. It was also the main consumer of the daily API budget and
+  was running on stale intraday cache data after the first scan of the day.
+* **Not removed**: the module, tests, indicators and dashboard rendering remain
+  intact. Re-enable by restoring `schedule_type="auto"` and
+  `frequency_minutes=10` once the intraday data path (prefilter/WebSocket) can
+  support it.
+* **Note**: the strategy computes its week-end/month-end flags in `__init__`
+  from the process start date. If it is run manually days after startup, those
+  flags can be stale; fix before relying on its weekly/monthly evaluation.
+
+---
+
 *This document is intended to provide an independent AI reviewer with complete context, design rationale, confirmed results, and identified gaps so that further improvements or mistakes can be identified without ambiguity.*

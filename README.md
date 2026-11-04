@@ -157,10 +157,13 @@ logic (all providers faked/mocked - no network).
 Concrete strategies (Phase 4+) each live in their own module with a
 `strategy_class` and are implemented from their spec - no logic is invented.
 
-### First strategy: Multi-Timeframe Doji (Phase 4)
+### First strategy: Multi-Timeframe Doji (Phase 4, manual/legacy)
 
 `app.strategies.doji.MultiTimeframeDojiStrategy` (universe **Nifty 500**,
-auto, 10-minute tick). Implements the BRD spec exactly:
+**manual only** since 2026-11-04). It is retained for ad-hoc research but no
+longer runs on the production schedule: the full-universe 10-minute scan needs
+~1,000 FYERS history calls and cannot keep up with a 10-minute cadence on the
+current plan. The BRD spec is implemented as follows:
 
 * **Doji geometry** on the last closed candle: `B/R <= 0.10` and
   `R >= 0.45 * ATR14` (Wilder's). Subtypes: dragonfly / gravestone /

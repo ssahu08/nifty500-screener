@@ -26,7 +26,8 @@ def test_metadata() -> None:
     assert meta.name == "Multi-Timeframe Doji"
     assert meta.category == Category.INTRADAY
     assert meta.universe == "NIFTY_500"
-    assert meta.schedule_type == "auto"
+    assert meta.schedule_type == "manual"
+    assert meta.frequency_minutes is None
     assert meta.timeframes == ["10m", "daily"]
 
 
