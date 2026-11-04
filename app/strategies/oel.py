@@ -5,7 +5,7 @@ never traded below the open during the session, so buyers were in control from
 the very first trade (e.g. LENSKART 28/10: the day opened at its low after a
 gap-down and rallied for the rest of the session).
 
-Two variants (all auto):
+Four variants (all auto):
 
 * **Intraday (10-minute)** - today's session so far: the 09:15 candle's open
   must still be the lowest price across every completed 10-minute bar.
@@ -14,6 +14,19 @@ Two variants (all auto):
   session ends, the completed daily candle takes over.
 * **Daily (EOD)** - the most recent COMPLETED daily candle: open == low.
   One signal per symbol per completed candle.
+* **Weekly** - the last completed weekly candle before the current week:
+  open == low. Built by resampling the daily frame to ``W-FRI``.
+* **Monthly** - the last completed monthly candle before the current month:
+  open == low. Built by resampling the daily frame to ``ME``.
+
+The weekly/monthly period advances on the first run of the new week/month, not
+at Friday's or month-end's close: the daily cache can still hold a partial
+current-day bar fetched earlier that afternoon. Waiting for the next period's
+first run means the prior period's daily bars are refreshed with final values.
+
+Weekly/monthly signals are cached per completed-period label and re-emitted on
+every scan, so the quote prefilter (which only keeps today's open == low
+symbols) cannot make them disappear between period boundaries.
 
 Open == low is the only gate; every match is kept. Matches are then ranked by
 a volume-led quality score so strong opening demand sorts to the top and thin
@@ -35,16 +48,16 @@ filters a signal out - it only changes the order.
 from __future__ import annotations
 
 import math
-from datetime import datetime, time
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from app.config import Settings
-from app.core.market import CONTINUOUS_CLOSE
+from app.core.market import CONTINUOUS_CLOSE, is_trading_day
 from app.data.provider import Quote, normalize_symbol
 from app.strategies.base import Category, Signal, Strategy, StrategyMetadata
-from app.strategies.indicators import closed_candles, volume_ratio
+from app.strategies.indicators import closed_candles, resample, volume_ratio
 
 IST = ZoneInfo("Asia/Kolkata")
 MARKET_OPEN = time(9, 15)
@@ -56,6 +69,11 @@ MIN_MOVE_PCT = 0.5
 MIN_INTRADAY_BARS = 6
 #: Same-bar sessions used for the opening-volume comparison.
 VOLUME_LOOKBACK = 10
+#: Higher-timeframe resampling rules (daily -> weekly/monthly).
+WEEKLY_RULE = "W-FRI"
+MONTHLY_RULE = "ME"
+#: Volume lookback per higher timeframe, in that timeframe's own candles.
+PERIOD_VOLUME_LOOKBACK = {"weekly": 20, "monthly": 12}
 
 
 def _open_equals_low(open_: float, low: float) -> bool:
@@ -251,8 +269,75 @@ def _volume_metadata(profile: dict) -> dict:
     }
 
 
+def _latest_completed_week_end(now: datetime) -> date:
+    """Last trading day of the ISO week before the one containing ``now``.
+
+    The period advances on the **first run of a new week**, not at Friday's
+    close. This matters because the daily cache can still hold a partial
+    current-day bar fetched earlier that afternoon (FYERS returns the day so
+    far). Waiting until the new week's first run guarantees the previous
+    week's daily candles were refreshed with their final values.
+    """
+    monday = now.date() - timedelta(days=now.date().weekday())
+    cursor = monday - timedelta(days=1)
+    while not is_trading_day(cursor):
+        cursor -= timedelta(days=1)
+    return cursor
+
+
+def _latest_completed_month_end(now: datetime) -> date:
+    """Last trading day of the calendar month before the one containing ``now``.
+
+    Like the weekly helper, the period advances on the first run of the new
+    month so the prior month's daily candles have settled in the cache.
+    """
+    cursor = now.date().replace(day=1) - timedelta(days=1)
+    while not is_trading_day(cursor):
+        cursor -= timedelta(days=1)
+    return cursor
+
+
+def _week_label(day: date) -> date:
+    """The Friday that labels the ISO week containing ``day``."""
+    return day + timedelta(days=4 - day.weekday())
+
+
+def _month_label(day: date) -> date:
+    """The calendar month-end that labels the month containing ``day``."""
+    nxt = (day.replace(day=28) + timedelta(days=4)).replace(day=1)
+    return nxt - timedelta(days=1)
+
+
+def _period_timestamp(frame: pd.DataFrame, label: date) -> pd.Timestamp:
+    """Timezone-aware 00:00 label used by a resampled period frame."""
+    ts = pd.Timestamp(label)
+    tz = getattr(frame.index, "tz", None)
+    return ts.tz_localize(tz) if tz is not None else ts
+
+
+def _period_candle(frame: pd.DataFrame, label: date) -> pd.Series | None:
+    """Return the resampled candle whose period label is ``label``."""
+    if frame is None or frame.empty:
+        return None
+    ts = _period_timestamp(frame, label)
+    if ts in frame.index:
+        return frame.loc[ts]
+    matches = frame[frame.index.date == label]
+    return matches.iloc[-1] if not matches.empty else None
+
+
 class OpenEqualsLowStrategy(Strategy):
-    """Open-Equals-Low engine (live 10-min + daily EOD, all auto)."""
+    """Open-Equals-Low engine (live 10-min + daily/weekly/monthly, all auto)."""
+
+    def __init__(self) -> None:
+        #: variant -> (completed-period label, signals). Higher-timeframe
+        #: signals are computed once per completed period and re-emitted on
+        #: every scan; the quote prefilter only keeps today's matches, so
+        #: without this cache they would vanish on the next run.
+        self._htf_cache: dict[str, tuple[str, list[Signal]]] = {}
+        #: Period keys captured by :meth:`prefilter` so :meth:`scan` makes the
+        #: same refresh decision within one run.
+        self._pending_keys: dict[str, str] | None = None
 
     @staticmethod
     def _is_open_equals_low(candle) -> bool:
@@ -264,9 +349,9 @@ class OpenEqualsLowStrategy(Strategy):
         return StrategyMetadata(
             name="Open-Equals-Low",
             description=(
-                "Day open price equals day low (price never traded below the "
-                "open). Live 10-min: today's low so far; daily EOD: completed "
-                "candle. Ranked by opening-volume quality."
+                "Open price equals low (price never traded below the open). "
+                "Live 10-min: today's low so far; daily EOD, weekly and monthly: "
+                "latest completed candle. Ranked by volume-led quality."
             ),
             category=Category.INTRADAY,
             universe="NIFTY_500",
@@ -277,15 +362,35 @@ class OpenEqualsLowStrategy(Strategy):
         )
 
     # -------------------------------------------------------------- prefilter
-    def prefilter(self, quotes: dict[str, Quote], settings: Settings) -> list[str]:
+    def prefilter(
+        self,
+        quotes: dict[str, Quote],
+        settings: Settings,
+        *,
+        now: datetime | None = None,
+    ) -> list[str]:
         """Keep only symbols whose day open is still the day low.
 
         The batched quote already carries today's open and low, which is the
-        entire OEL gate. Fetching 10-minute and daily history for all ~500
-        symbols every 10 minutes otherwise burns the whole Fyers quota and
+        entire day-level OEL gate. Fetching 10-minute and daily history for all
+        ~500 symbols every 10 minutes otherwise burns the whole Fyers quota and
         makes a scan take ~25 minutes. Symbols with a missing/incomplete quote
         are kept so a data hiccup can never hide a signal.
+
+        When a new weekly/monthly period has completed, the higher-timeframe
+        cache is stale and daily candles are needed for the *whole* universe
+        (the quote gate only knows about today). In that case return the full
+        universe once; the next runs go back to the cheap quote prefilter.
         """
+        now = now if now is not None else datetime.now(IST)
+        if getattr(now, "tzinfo", None) is None:
+            now = now.replace(tzinfo=IST)
+
+        keys = self._htf_keys(now)
+        self._pending_keys = keys
+        if any(self._needs_refresh(variant, keys[variant]) for variant in keys):
+            return self.get_universe(settings)
+
         kept: list[str] = []
         for symbol in self.get_universe(settings):
             quote = quotes.get(normalize_symbol(symbol))
@@ -308,6 +413,17 @@ class OpenEqualsLowStrategy(Strategy):
         if getattr(now, "tzinfo", None) is None:
             now = now.replace(tzinfo=IST)
 
+        # Reuse the keys prefilter decided on so the fetch and the scan agree
+        # even if the clock crosses a period boundary between the two calls.
+        keys = self._pending_keys or self._htf_keys(now)
+        self._pending_keys = None
+        refresh = {
+            variant: self._needs_refresh(variant, key) for variant, key in keys.items()
+        }
+        fresh: dict[str, list[Signal]] = {
+            variant: [] for variant, needed in refresh.items() if needed
+        }
+
         signals: list[Signal] = []
 
         for symbol, frames in data.items():
@@ -323,6 +439,22 @@ class OpenEqualsLowStrategy(Strategy):
             if sig is not None:
                 signals.append(sig)
 
+            for variant in fresh:
+                label = date.fromisoformat(keys[variant])
+                sig = self._scan_period(
+                    symbol, frames.get("daily"), now, variant, label
+                )
+                if sig is not None:
+                    fresh[variant].append(sig)
+
+        # Persist the freshly computed higher-timeframe signals for this period
+        # and always re-emit them, so the day-level quote prefilter cannot hide
+        # a completed weekly/monthly candle between runs.
+        for variant, needed in refresh.items():
+            if needed:
+                self._htf_cache[variant] = (keys[variant], fresh[variant])
+            signals.extend(self._htf_cache[variant][1])
+
         # Rank by quality: high opening volume first, thin matches last.
         signals.sort(
             key=lambda s: (
@@ -332,6 +464,95 @@ class OpenEqualsLowStrategy(Strategy):
             )
         )
         return signals
+
+    # --------------------------------------------------- higher timeframes
+    @staticmethod
+    def _htf_keys(now: datetime) -> dict[str, str]:
+        """Completed-period labels for the weekly and monthly variants."""
+        return {
+            "weekly": _week_label(_latest_completed_week_end(now)).isoformat(),
+            "monthly": _month_label(_latest_completed_month_end(now)).isoformat(),
+        }
+
+    def _needs_refresh(self, variant: str, key: str) -> bool:
+        cached = self._htf_cache.get(variant)
+        return cached is None or cached[0] != key
+
+    def _scan_period(
+        self, symbol, raw, now, variant: str, label: date
+    ) -> Signal | None:
+        """Evaluate the latest completed weekly or monthly candle."""
+        daily = closed_candles(raw, "daily", now)
+        if daily is None or daily.empty:
+            return None
+
+        if variant == "weekly":
+            rule = WEEKLY_RULE
+            prefix = "week"
+        elif variant == "monthly":
+            rule = MONTHLY_RULE
+            prefix = "month"
+        else:
+            return None
+
+        frame = resample(daily, rule)
+        candle = _period_candle(frame, label)
+        if candle is None or not _open_equals_low(candle["open"], candle["low"]):
+            return None
+
+        # Trim to the completed period so the volume ratio compares like with
+        # like and never includes the in-progress candle.
+        history = frame.loc[: _period_timestamp(frame, label)]
+        if history.empty:
+            return None
+
+        open_ = float(candle["open"])
+        low = float(candle["low"])
+        high = float(candle["high"])
+        close = float(candle["close"])
+        move = _move_pct(open_, close)
+        period_ratio = volume_ratio(history, PERIOD_VOLUME_LOOKBACK[variant])
+        turnover = close * float(candle["volume"]) / 1e7
+
+        metrics = _quality_metrics(
+            open_ratio=None,
+            open_pctile=None,
+            daily_ratio=period_ratio,
+            move_pct=move,
+            close=close,
+            low=low,
+            high=high,
+            turnover_cr=turnover,
+        )
+        metrics["volume_basis"] = variant
+
+        return Signal(
+            symbol=symbol,
+            strategy_name=self.metadata.name,
+            timestamp=candle.name.to_pydatetime(),
+            price=close,
+            metadata={
+                "timeframe": variant,
+                "variant": variant,
+                "passes_filters": _passes_filters(move, metrics["volume_ratio"]),
+                **metrics,
+                "period_vol_ratio": round(period_ratio, 2),
+                "daily_vol_ratio": None,
+                "open_vol_ratio": None,
+                "open_vol_pctile": None,
+                "open_vol_vs_prev": None,
+                "open_vol_history_days": 0,
+                "first_bar_volume": None,
+                "first_bar_turnover_cr": None,
+                "move_pct": round(move, 2),
+                f"{prefix}_open": round(open_, 2),
+                f"{prefix}_low": round(low, 2),
+                f"{prefix}_high": round(high, 2),
+                f"{prefix}_close": round(close, 2),
+                "ltp": round(close, 2),
+                "period_label": label.isoformat(),
+            },
+        )
 
     # -------------------------------------------------------------- 10-minute
     def _scan_intraday(self, symbol, raw, now) -> Signal | None:

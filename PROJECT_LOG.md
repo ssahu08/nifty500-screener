@@ -23,9 +23,9 @@ Key user rules interpreted and implemented:
 6. **No duplicate `app/core/fyers_auth.py`**; single token manager is `app/data/fyers.py::FyersAuthenticator`.
 7. **Dashboard PIN protects public dashboard**; credentials only in `.env`.
 8. **No service worker in the PWA**.
-9. **OEL emits only day-level signals** (no weekly/monthly historical variants — removed entirely).
+9. **OEL emits completed-candle signals on daily, weekly and monthly timeframes** (weekly/monthly restored 2026-11-04).
 10. **Buy-band only for banded strategies**.
-11. **Keep `app/strategies/oel.py` as the main engine** (not split into weekly/monthly variants).
+11. **Keep `app/strategies/oel.py` as the main engine** (weekly/monthly live in the same module).
 
 ---
 
@@ -33,9 +33,12 @@ Key user rules interpreted and implemented:
 
 ### 2.1 OEL Engine (`app/strategies/oel.py`)
 
-**Variants kept (after removing weekly/monthly):**
+**Variants (weekly/monthly restored 2026-11-04):**
 - **Intraday (10-minute)**: evaluated live during the session. Requires 6 completed bars (10:15 IST) to avoid noise at 09:25. Stops at 15:15 continuous close so daily candle takes over.
 - **Daily (EOD)**: last completed daily candle where `open == low`.
+- **Weekly**: last completed `W-FRI` candle resampled from daily where `open == low`.
+- **Monthly**: last completed `ME` candle resampled from daily where `open == low`.
+- The period advances on the first run of the new week/month (not at Friday/month-end close), so the prior period's daily bars have been refreshed with final values. Higher-timeframe signals are cached per completed-period label so the quote prefilter cannot hide them between runs.
 
 **Critical fix applied (previous gap)**:
 - Before: the code evaluated `most recent date` rather than `today`. At 09:30, this meant yesterday's data was evaluated, producing stale signals and blocking today's real signal.
@@ -133,7 +136,7 @@ UI updates implemented:
 | 8 | DRREDDY | 22.6 | LOW | 0.18x | 10% | 0.73x | 1345.0 | 1345.0 | 0.52% |
 
 ### Database (`data/screener.db`)
-- Strategy `Open-Equals-Low` has 736 total historical rows (includes older weekly/monthly variants from before removal and the new 8 daily rows).
+- Strategy `Open-Equals-Low` has 736 total historical rows (includes older weekly/monthly rows from before the 2026-10-30 removal and the new 8 daily rows). The `variant` column now separates intraday/EOD/weekly/monthly occurrences on the same timestamp.
 - Latest run (`run_at = 2026-10-30T22:57:52+05:30`) contains the 8 daily signals above with full metadata refreshed.
 
 ---
@@ -144,7 +147,7 @@ UI updates implemented:
 
 1. **Previous gap: 10-minute variant evaluated yesterday's date** (`now` used `most recent date` instead of `today`). **Fixed**.
 2. **Previous gap: `_seen` stateless tracking blocked re-scans** (`_seen` never cleared, so a second scan of the same valid candle returned nothing). **Fixed** (removed from strategy; storage handles dedup).
-3. **Previous gap: weekly/monthly historical variants** emitted historical signals that were not true day-level OEL. **Fixed** (variants removed from `oel.py`). The DB still contains old weekly/monthly rows from the previous version (`run_at = 2026-10-30T21:43:51`); these are historical artifacts, not active signals.
+3. **Previous gap: weekly/monthly historical variants** emitted historical signals that were not true day-level OEL. They were removed on 2026-10-30 and **restored correctly on 2026-11-04**: only the latest *completed* weekly/monthly candle is emitted, built from daily resampling, with the in-progress period dropped. Old rows remain historical artifacts, not active signals.
 4. **Previous gap: volume ranking did not compare to same 09:15 bar** (would have compared to random intraday candles). **Fixed** (`_first_bars` filters `time == 09:15`).
 5. **Dashboard preview**: `PREVIEW_ROWS` was 5, which truncated the full 8-signal OEL list. **Fixed** (OEL uses 20 preview rows).
 6. **No volume column on dashboard** before this session. **Fixed** (new `.vol-cell` column, tooltip, and CSS).
@@ -177,7 +180,7 @@ UI updates implemented:
 | Dashboard JS | `app/static/app.js` | `volumeTooltip` (line ~317), `qualityPill` (line ~302), `volCell` (line ~433), `signalsTable` (line ~382) |
 | Dashboard CSS | `app/static/styles.css` | `.quality-pill` (line 439), `.vol-cell` (line 470), `.vol-main`/`.vol-sub` |
 | Dashboard HTML | `app/static/index.html` | Cache bust links (`v=25` for JS, `v=15` for CSS) |
-| Tests (OEL) | `tests/test_oel.py` | `test_intraday_ranks...` (line ~350), `test_daily_quality...` (line ~390), `test_no_weekly_or_monthly...` (line ~354) |
+| Tests (OEL) | `tests/test_oel.py` | `test_intraday_ranks...`, `test_daily_quality...`, `test_weekly_variant...`, `test_monthly_variant...`, `test_weekly_ignores_in_progress...`, `test_prefilter_returns_full_universe...` |
 | Tests (Storage) | `tests/test_storage.py` | `test_save_run_refreshes...` (line 110) |
 | Tests (Telegram) | `tests/test_telegram.py` | `test_oel_alert_ranks...` (line ~221) |
 | README / docs | `README.md` | OEL section updated (line 243+) |
@@ -206,7 +209,7 @@ Since `git init` has not been executed, all files are untracked. The user explic
 - [x] Volume column (`volCell`) visible in dashboard with tooltip showing `vol10`, `pctile`, `daily_vol_ratio`, `turnover_cr`.
 - [x] CSS (`.vol-cell`, `.quality-pill`) implemented.
 - [x] Dashboard cache bust (`v=25` JS, `v=15` CSS).
-- [x] Weekly/monthly OEL variants removed from `oel.py`; DB still contains old rows from previous version.
+- [x] Weekly/monthly OEL variants restored correctly (latest completed candle only; in-progress period dropped).
 - [x] Stateles scan (`_seen` removed); `save_run` refreshes price/metadata.
 - [x] Telegram formatter updated (rank, score, quality, `vol10`, `open/low`).
 - [x] `passes_filters` remains informational (not a gate).
@@ -432,6 +435,46 @@ advisory only - the screener never places orders.
   errors; after-hours state correctly reports `market_closed`.
 * Live intraday validation of the movement gate was not possible at 17:57 IST
   (market closed); the next expiry is Monday 9 Nov 2026 (10 Nov holiday-shifted).
+
+---
+
+## 10. OEL Weekly/Monthly Restoration — 2026-11-04
+
+### What changed
+* **Weekly variant**: resamples the closed daily frame to `W-FRI` and evaluates
+  the last completed week before the current one. Emits `variant="weekly"`,
+  `timeframe="weekly"` and `week_open/low/high/close` metadata.
+* **Monthly variant**: resamples to `ME` and evaluates the last completed month
+  before the current one. Emits `variant="monthly"`, `timeframe="monthly"` and
+  `month_open/low/high/close`.
+* The period advances on the **first run of the new week/month**, not at
+  Friday's or month-end's close. The daily cache can still hold a partial
+  current-day bar fetched earlier that afternoon; waiting for the next
+  period's first run guarantees the prior period's daily bars were refreshed
+  with final values.
+* Higher-timeframe signals are cached per completed-period label and re-emitted
+  on every scan, so the day-level quote prefilter cannot hide them between
+  runs. On a period-key change the prefilter returns the full universe once so
+  daily candles exist for every symbol; normal runs use the cheap quote gate.
+* Weekly/monthly ranking uses the completed period's volume versus its own
+  history (20 weeks / 12 months); the 09:15 opening-bar score remains the
+  intraday/EOD basis.
+* SQLite `runs` now has a `variant` column, included in the unique dedupe index,
+  so weekly and monthly signals that share a period-end timestamp cannot
+  collide. Older databases are migrated and backfilled from metadata.
+* Dashboard adds **Weekly** and **Monthly** OEL subtabs; the Open/Low cell reads
+  `day_*`, `week_*` or `month_*` and the volume column shows the period ratio.
+* Fixed an off-by-one in `is_last_trading_day_of_week`: Friday was incorrectly
+  treated as a mid-week day because the loop included the following Monday.
+  This also fixes weekly Doji evaluation on Fridays.
+
+### Verified
+* Full suite: **317 passed, 1 warning**; `ruff check app tests` clean.
+* Real cached daily data (4 Nov 2026) produced 14 completed weekly and 3
+  completed monthly OEL matches; spot checks (ACUTAAS, MPHASIS, TARIL,
+  LEMONTREE, PERSISTENT) carried correct `open == low` and period labels.
+* The new variants add no FYERS timeframes and no extra API calls beyond the
+  once-per-period full-universe daily refresh.
 
 ---
 

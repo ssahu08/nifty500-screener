@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import date
+
 import pandas as pd
 
 from app.config import Settings
+from app.core.market import load_holidays
 from app.data.provider import Quote
 from app.strategies.base import Category
 from app.strategies.oel import OpenEqualsLowStrategy
@@ -47,6 +50,38 @@ def _daily_frame(n=30, open_eq_low=True, end=None):
                 }
             )
     return pd.DataFrame(rows, index=idx)
+
+
+def _business_daily_frame(start, end, *, open_eq_low=True, match_from=None):
+    """Business-day daily frame (NSE holidays removed).
+
+    When ``match_from`` is given, only candles on/after that date have
+    open == low; earlier candles keep a lower low. This makes it possible to
+    give the completed period and the in-progress period different OEL states.
+    """
+    idx = pd.bdate_range(start, end, tz="Asia/Kolkata")
+    holidays = load_holidays()
+    idx = idx[~pd.Index(idx.date).isin(holidays)]
+    rows = []
+    for ts in idx:
+        matched = open_eq_low if match_from is None else ts.date() >= match_from
+        rows.append(
+            {
+                "open": 100.0,
+                "high": 105.0,
+                "low": 100.0 if matched else 98.0,
+                "close": 103.0,
+                "volume": 100.0,
+            }
+        )
+    return pd.DataFrame(rows, index=idx)
+
+
+def _seed_htf_cache(strategy: OpenEqualsLowStrategy, now) -> None:
+    """Mark both higher timeframes as current so prefilter stays cheap."""
+    strategy._htf_cache = {
+        variant: (key, []) for variant, key in strategy._htf_keys(now).items()
+    }
 
 
 def _intraday_frame(n=30, open_eq_low=True):
@@ -352,15 +387,122 @@ def test_intraday_ignores_yesterday_data() -> None:
     assert intraday == []
 
 
-def test_no_weekly_or_monthly_variants() -> None:
-    """Only day-level OEL is emitted (live 10m + EOD daily)."""
+def test_weekly_variant_uses_latest_completed_candle() -> None:
     s = OpenEqualsLowStrategy()
-    daily = _daily_frame(60)
-    data = {"SBIN": {"10m": _intraday_frame(), "daily": daily}}
-    signals = s.scan(data, _settings(), now=NOW_DAILY)
-    tfs = {sig.metadata["timeframe"] for sig in signals}
-    assert tfs <= {"10m", "daily"}
-    assert "daily" in tfs
+    daily = _business_daily_frame("2025-10-01", "2026-01-30")
+    # The period advances on the first run of the new week (Mon 2 Feb), so the
+    # completed 26-30 Jan week is the latest eligible one.
+    now = pd.Timestamp("2026-02-02 10:00", tz="Asia/Kolkata")
+    signals = s.scan({"SBIN": {"daily": daily}}, _settings(), now=now)
+
+    weekly = [sig for sig in signals if sig.metadata["variant"] == "weekly"]
+    assert len(weekly) == 1
+    meta = weekly[0].metadata
+    assert meta["timeframe"] == "weekly"
+    assert meta["week_open"] == 100.0
+    assert meta["week_low"] == 100.0
+    assert meta["period_label"] == "2026-01-30"
+    assert meta["volume_basis"] == "weekly"
+    assert meta["period_vol_ratio"] is not None
+    assert weekly[0].timestamp == pd.Timestamp(
+        "2026-01-30", tz="Asia/Kolkata"
+    ).to_pydatetime()
+
+
+def test_monthly_variant_uses_latest_completed_candle() -> None:
+    s = OpenEqualsLowStrategy()
+    daily = _business_daily_frame("2025-01-01", "2026-11-30")
+    # The period advances on the first run of the new month (Tue 1 Dec).
+    now = pd.Timestamp("2026-12-01 10:00", tz="Asia/Kolkata")
+    signals = s.scan({"SBIN": {"daily": daily}}, _settings(), now=now)
+
+    monthly = [sig for sig in signals if sig.metadata["variant"] == "monthly"]
+    assert len(monthly) == 1
+    meta = monthly[0].metadata
+    assert meta["timeframe"] == "monthly"
+    assert meta["month_open"] == 100.0
+    assert meta["month_low"] == 100.0
+    assert meta["period_label"] == "2026-11-30"
+    assert meta["volume_basis"] == "monthly"
+    assert monthly[0].timestamp == pd.Timestamp(
+        "2026-11-30", tz="Asia/Kolkata"
+    ).to_pydatetime()
+
+
+def test_weekly_ignores_in_progress_week() -> None:
+    """Only the last *completed* week is eligible, not the forming one."""
+    s = OpenEqualsLowStrategy()
+    # Week ending 23 Jan does not match; the in-progress 26-30 Jan week does.
+    daily = _business_daily_frame(
+        "2025-10-01",
+        "2026-01-28",
+        open_eq_low=False,
+        match_from=date(2026, 1, 26),
+    )
+    now = pd.Timestamp("2026-01-28 16:00", tz="Asia/Kolkata")
+    signals = s.scan({"SBIN": {"daily": daily}}, _settings(), now=now)
+    assert [x for x in signals if x.metadata["variant"] == "weekly"] == []
+
+    # The following Monday the completed 26-30 Jan week becomes eligible.
+    daily = _business_daily_frame(
+        "2025-10-01",
+        "2026-01-30",
+        open_eq_low=False,
+        match_from=date(2026, 1, 26),
+    )
+    now = pd.Timestamp("2026-02-02 10:00", tz="Asia/Kolkata")
+    signals = s.scan({"SBIN": {"daily": daily}}, _settings(), now=now)
+    weekly = [x for x in signals if x.metadata["variant"] == "weekly"]
+    assert len(weekly) == 1
+    assert weekly[0].metadata["period_label"] == "2026-01-30"
+
+
+def test_monthly_ignores_in_progress_month() -> None:
+    """Only the last *completed* month is eligible, not the forming one."""
+    s = OpenEqualsLowStrategy()
+    # October 2026 does not match; the in-progress November 2026 does.
+    daily = _business_daily_frame(
+        "2025-01-01",
+        "2026-11-04",
+        open_eq_low=False,
+        match_from=date(2026, 11, 2),
+    )
+    now = pd.Timestamp("2026-11-04 16:00", tz="Asia/Kolkata")
+    signals = s.scan({"SBIN": {"daily": daily}}, _settings(), now=now)
+    assert [x for x in signals if x.metadata["variant"] == "monthly"] == []
+
+    # The first run of December makes the completed November month eligible.
+    daily = _business_daily_frame(
+        "2025-01-01",
+        "2026-11-30",
+        open_eq_low=False,
+        match_from=date(2026, 11, 2),
+    )
+    now = pd.Timestamp("2026-12-01 10:00", tz="Asia/Kolkata")
+    signals = s.scan({"SBIN": {"daily": daily}}, _settings(), now=now)
+    monthly = [x for x in signals if x.metadata["variant"] == "monthly"]
+    assert len(monthly) == 1
+    assert monthly[0].metadata["period_label"] == "2026-11-30"
+
+
+def test_higher_timeframe_signals_are_reemitted_from_cache() -> None:
+    """The quote prefilter only keeps today's matches; cached weekly/monthly
+    signals must still be visible on later scans."""
+    s = OpenEqualsLowStrategy()
+    daily = _business_daily_frame("2025-10-01", "2026-01-30")
+    now = pd.Timestamp("2026-02-02 10:00", tz="Asia/Kolkata")
+
+    first = s.scan({"SBIN": {"daily": daily}}, _settings(), now=now)
+    assert [x for x in first if x.metadata["variant"] == "weekly"]
+
+    # A later run fetched only a different symbol (as the prefilter would).
+    second = s.scan(
+        {"OTHER": {"daily": _business_daily_frame("2025-10-01", "2026-01-30")}},
+        _settings(),
+        now=now,
+    )
+    weekly = [x for x in second if x.metadata["variant"] == "weekly"]
+    assert [x.symbol for x in weekly] == ["SBIN"]
 
 
 def test_daily_signals_each_completed_candle_once() -> None:
@@ -455,6 +597,8 @@ def test_daily_quality_falls_back_to_daily_volume_without_10m() -> None:
 def test_prefilter_keeps_only_open_equals_low(monkeypatch) -> None:
     """Only OEL candidates get candle history; missing quotes are kept."""
     s = OpenEqualsLowStrategy()
+    now = pd.Timestamp("2026-01-30 16:00", tz="Asia/Kolkata")
+    _seed_htf_cache(s, now)
     monkeypatch.setattr(
         s, "get_universe", lambda settings: ["AAA", "BBB", "CCC", "DDD"]
     )
@@ -470,11 +614,13 @@ def test_prefilter_keeps_only_open_equals_low(monkeypatch) -> None:
             "NSE:DDD-EQ", ltp=101.0, open=100.0, high=105.0, low=None
         ),
     }
-    assert s.prefilter(quotes, _settings()) == ["AAA", "CCC", "DDD"]
+    assert s.prefilter(quotes, _settings(), now=now) == ["AAA", "CCC", "DDD"]
 
 
 def test_prefilter_returns_empty_when_no_open_equals_low(monkeypatch) -> None:
     s = OpenEqualsLowStrategy()
+    now = pd.Timestamp("2026-01-30 16:00", tz="Asia/Kolkata")
+    _seed_htf_cache(s, now)
     monkeypatch.setattr(s, "get_universe", lambda settings: ["AAA", "BBB"])
     quotes = {
         "NSE:AAA-EQ": Quote(
@@ -484,4 +630,26 @@ def test_prefilter_returns_empty_when_no_open_equals_low(monkeypatch) -> None:
             "NSE:BBB-EQ", ltp=101.0, open=100.0, high=105.0, low=98.0
         ),
     }
-    assert s.prefilter(quotes, _settings()) == []
+    assert s.prefilter(quotes, _settings(), now=now) == []
+
+
+def test_prefilter_returns_full_universe_when_htf_cache_is_stale(monkeypatch) -> None:
+    """A new completed week/month needs daily candles for the whole universe."""
+    s = OpenEqualsLowStrategy()
+    now = pd.Timestamp("2026-01-30 16:00", tz="Asia/Kolkata")
+    monkeypatch.setattr(s, "get_universe", lambda settings: ["AAA", "BBB"])
+    quotes = {
+        "NSE:AAA-EQ": Quote(
+            "NSE:AAA-EQ", ltp=101.0, open=100.0, high=105.0, low=99.0
+        ),
+        "NSE:BBB-EQ": Quote(
+            "NSE:BBB-EQ", ltp=101.0, open=100.0, high=105.0, low=100.0
+        ),
+    }
+
+    # Empty cache -> full universe so the period candles can be recomputed.
+    assert s.prefilter(quotes, _settings(), now=now) == ["AAA", "BBB"]
+
+    # Current cache -> cheap quote gate again.
+    _seed_htf_cache(s, now)
+    assert s.prefilter(quotes, _settings(), now=now) == ["BBB"]

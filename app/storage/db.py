@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS runs (
     symbol TEXT NOT NULL,
     signal_time TEXT NOT NULL,
     direction TEXT NOT NULL DEFAULT '',
+    variant TEXT NOT NULL DEFAULT '',
     price REAL NOT NULL,
     metadata TEXT DEFAULT '{}'
 );
@@ -75,17 +76,37 @@ class SignalStore:
                             (direction, row["id"]),
                         )
 
+            # Migration: older databases have no variant column. Add it and
+            # backfill from metadata. Without it, OEL weekly and monthly
+            # signals that share a period-end timestamp would collide.
+            if "variant" not in columns:
+                conn.execute(
+                    "ALTER TABLE runs ADD COLUMN variant TEXT NOT NULL DEFAULT ''"
+                )
+                for row in conn.execute("SELECT id, metadata FROM runs").fetchall():
+                    try:
+                        variant = str(
+                            json.loads(row["metadata"] or "{}").get("variant", "")
+                        )
+                    except (json.JSONDecodeError, TypeError):
+                        variant = ""
+                    if variant:
+                        conn.execute(
+                            "UPDATE runs SET variant = ? WHERE id = ?",
+                            (variant, row["id"]),
+                        )
+
             # One row per occurrence: dedupe any pre-existing repeats, then
             # enforce it (a candle may be re-evaluated by a later run).
             conn.execute("DROP INDEX IF EXISTS idx_runs_unique")
             conn.execute(
                 "DELETE FROM runs WHERE id NOT IN "
                 "(SELECT MIN(id) FROM runs GROUP BY "
-                "strategy_name, symbol, signal_time, direction)"
+                "strategy_name, symbol, signal_time, direction, variant)"
             )
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_unique "
-                "ON runs(strategy_name, symbol, signal_time, direction)"
+                "ON runs(strategy_name, symbol, signal_time, direction, variant)"
             )
 
     def save_run(self, strategy_name: str, signals: list[Signal]) -> list[Signal]:
@@ -101,9 +122,14 @@ class SignalStore:
         now = datetime.now(IST).isoformat()
         with self._connect() as conn:
             seen = {
-                (row["symbol"], row["signal_time"], row["direction"]): row["id"]
+                (
+                    row["symbol"],
+                    row["signal_time"],
+                    row["direction"],
+                    row["variant"],
+                ): row["id"]
                 for row in conn.execute(
-                    "SELECT id, symbol, signal_time, direction FROM runs "
+                    "SELECT id, symbol, signal_time, direction, variant FROM runs "
                     "WHERE strategy_name = ?",
                     (strategy_name,),
                 )
@@ -111,7 +137,8 @@ class SignalStore:
             fresh = []
             for s in signals:
                 direction = str((s.metadata or {}).get("direction", ""))
-                key = (s.symbol, s.timestamp.isoformat(), direction)
+                variant = str((s.metadata or {}).get("variant", ""))
+                key = (s.symbol, s.timestamp.isoformat(), direction, variant)
                 if key in seen:
                     # Re-evaluating the same candle refreshes its live price and
                     # metadata (e.g. volume rank, move) but must not re-alert.
@@ -132,7 +159,7 @@ class SignalStore:
                 conn.executemany(
                     "INSERT OR IGNORE INTO runs "
                     "(strategy_name, run_at, symbol, signal_time, direction, "
-                    "price, metadata) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "variant, price, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     [
                         (
                             strategy_name,
@@ -140,6 +167,7 @@ class SignalStore:
                             s.symbol,
                             s.timestamp.isoformat(),
                             str((s.metadata or {}).get("direction", "")),
+                            str((s.metadata or {}).get("variant", "")),
                             s.price,
                             json.dumps(s.metadata, default=str),
                         )

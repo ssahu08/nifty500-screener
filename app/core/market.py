@@ -75,7 +75,10 @@ def is_last_trading_day_of_week(day: date) -> bool:
     """
     if not is_trading_day(day):
         return False
-    for offset in range(1, 8 - day.weekday()):
+    # Only the remaining days of THIS ISO week (Saturday/Sunday when the day
+    # is Friday). Using ``8 - weekday`` would incorrectly include next Monday
+    # and make Friday never look like a week-end.
+    for offset in range(1, 7 - day.weekday()):
         candidate = day + timedelta(days=offset)
         if is_trading_day(candidate):
             return False

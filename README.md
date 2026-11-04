@@ -255,8 +255,8 @@ would duplicate the 15:35 alerts.
 ### Open-Equals-Low
 
 `app.strategies.oel.OpenEqualsLowStrategy` (universe **Nifty 500**, auto every
-10 minutes, 10-min + daily). The rule is literal: the **day's open price must
-equal the day's low price** - the stock never traded below its open.
+10 minutes, 10-min + daily). The rule is literal: the **open price must equal
+the low price** - the stock never traded below its open.
 
 * **Live 10-minute variant**: uses the 09:15 candle's open and the minimum low
   across *all* completed 10-minute bars so far today. It only starts after one
@@ -264,6 +264,16 @@ equal the day's low price** - the stock never traded below its open.
   trivially the open for almost every stock. It stops at the 15:15 continuous
   close so the EOD daily candle takes over.
 * **Daily EOD variant**: the last completed daily candle must have open == low.
+* **Weekly and monthly variants**: the last **completed** weekly (`W-FRI`) or
+  monthly (`ME`) candle before the current week/month must have open == low.
+  Both are built by resampling the daily frame in memory - no extra API calls
+  and no native FYERS weekly/monthly cache. The period advances on the first
+  run of the new week/month rather than at Friday's or month-end's close,
+  because the daily cache can still hold a partial current-day bar fetched
+  earlier that afternoon; waiting for the next period's first run guarantees
+  the prior period's daily bars were refreshed with final values. Signals
+  carry `week_open/low/high/close` or `month_open/low/high/close` plus
+  `period_label`.
 * **Quote prefilter**: before any candle history is fetched, one batched quote
   per symbol checks `open == low` (2-decimal match) on the live day. This is
   exactly the same gate as the 10-minute variant (the quote's day low is the
@@ -272,6 +282,12 @@ equal the day's low price** - the stock never traded below its open.
   10-minute and daily candles, which keeps a run to seconds instead of
   ~25 minutes for all 501 symbols. Matches are never filtered out; they are
   only ranked by the quality score below.
+* **Higher-timeframe refresh**: weekly/monthly signals are cached per completed
+  period label and re-emitted on every scan, so the day-level quote prefilter
+  cannot make them disappear between runs. When the period key advances (first
+  run of a new week/month), the prefilter returns the full universe once so
+  daily candles exist for every symbol; subsequent runs go back to the cheap
+  quote gate.
 * Price and `move_pct` are the latest completed close and the move from the
   day's open (not stale first-candle values); the alert shows `open=... low=...`
   so the criterion is verifiable.
@@ -286,9 +302,9 @@ equal the day's low price** - the stock never traded below its open.
   HIGH >= 70, MEDIUM >= 45, LOW < 45; the dashboard and Telegram show the
   score, quality label and `vol10=...x` (with the percentile), so low-volume
   matches visibly sort last. When 10-minute history is unavailable the daily
-  volume ratio is used as a fallback. `passes_filters` remains informational.
-* Weekly/monthly historical variants were removed because they are not
-  day-level signals.
+  volume ratio is used as a fallback. Weekly/monthly signals rank on the
+  completed period's volume versus its own 20-week/12-month history.
+  `passes_filters` remains informational.
 
 ### Nifty Hedge 23 (expiry-day trending straddle/strangle, advisory only)
 

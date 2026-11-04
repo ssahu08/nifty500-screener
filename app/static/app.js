@@ -337,6 +337,9 @@ function volumeTooltip(meta) {
     if (meta.open_vol_vs_prev != null) {
       parts.push(`${meta.open_vol_vs_prev}x vs yesterday's opening bar`);
     }
+  } else if (meta.period_vol_ratio != null) {
+    const unit = meta.variant === "monthly" ? "month" : "week";
+    parts.push(`${unit} volume ${meta.period_vol_ratio}x vs prior ${unit}s`);
   } else if (meta.daily_vol_ratio != null) {
     parts.push("10m history unavailable - using daily volume");
   }
@@ -393,13 +396,24 @@ function signalsTable(signals, name) {
     return `<div class="card-table"><div class="empty">${message}</div></div>`;
   }
   const hasScore = signals.some((s) => s.metadata && s.metadata.score != null);
-  // Open-Equals-Low: expose the day open/low so the criterion is verifiable.
-  const hasDayOpen = signals.some((s) => s.metadata && s.metadata.day_open != null);
-  // OEL volume proof: opening 09:15 bar vs prior sessions, plus full-day ratio.
+  // Open-Equals-Low: expose the candle open/low so the criterion is verifiable.
+  const oelPrefix = (meta) =>
+    meta.day_open != null
+      ? "day"
+      : meta.week_open != null
+        ? "week"
+        : meta.month_open != null
+          ? "month"
+          : null;
+  const hasOelOpen = signals.some((s) => oelPrefix(s.metadata || {}) != null);
+  // OEL volume proof: opening 09:15 bar vs prior sessions, full-day ratio or
+  // the higher-timeframe period ratio.
   const hasVolume = signals.some(
     (s) =>
       s.metadata &&
-      (s.metadata.open_vol_ratio != null || s.metadata.daily_vol_ratio != null)
+      (s.metadata.open_vol_ratio != null ||
+        s.metadata.daily_vol_ratio != null ||
+        s.metadata.period_vol_ratio != null)
   );
   const ordered = hasScore
     ? [...signals].sort(
@@ -421,17 +435,21 @@ function signalsTable(signals, name) {
           }${qualityPill(meta)}${bandPill(meta)}</td>`
         : "";
       let oelCell = "";
-      if (hasDayOpen) {
-        const open = meta.day_open;
-        const low = meta.day_low;
+      const prefix = oelPrefix(meta);
+      if (hasOelOpen) {
+        const open = prefix ? meta[`${prefix}_open`] : null;
+        const low = prefix ? meta[`${prefix}_low`] : null;
         const matches = open != null && low != null && open === low;
         const tip = [
           meta.timeframe ? `tf=${meta.timeframe}` : "",
+          meta.period_label ? `period=${meta.period_label}` : "",
           meta.open_vol_ratio != null
             ? `vol10=${meta.open_vol_ratio}x`
-            : meta.volume_ratio != null
-              ? `vol=${meta.volume_ratio}x`
-              : "",
+            : meta.period_vol_ratio != null
+              ? `vol${prefix}=${meta.period_vol_ratio}x`
+              : meta.volume_ratio != null
+                ? `vol=${meta.volume_ratio}x`
+                : "",
           meta.open_vol_pctile != null ? `beats ${meta.open_vol_pctile}%` : "",
           meta.move_pct != null ? `move=${meta.move_pct}%` : "",
         ].filter(Boolean).join(" · ");
@@ -443,8 +461,21 @@ function signalsTable(signals, name) {
       if (hasVolume) {
         const openRatio = meta.open_vol_ratio;
         const dailyRatio = meta.daily_vol_ratio;
-        const primary = openRatio != null ? openRatio : dailyRatio;
-        const tag = openRatio != null ? "open" : "day";
+        const periodRatio = meta.period_vol_ratio;
+        const primary =
+          openRatio != null
+            ? openRatio
+            : periodRatio != null
+              ? periodRatio
+              : dailyRatio;
+        const tag =
+          openRatio != null
+            ? "open"
+            : periodRatio != null
+              ? meta.variant === "monthly"
+                ? "month"
+                : "week"
+              : "day";
         const tone =
           primary == null
             ? ""
@@ -473,9 +504,9 @@ function signalsTable(signals, name) {
     })
     .join("");
   const scoreHead = hasScore ? "<th>Score</th>" : "";
-  const oelHead = hasDayOpen ? "<th>Open / Low</th>" : "";
+  const oelHead = hasOelOpen ? "<th>Open / Low</th>" : "";
   const volHead = hasVolume
-    ? '<th title="First line: 09:15 10-min volume vs the same bar on the prior 10 sessions. Second line: full-day volume vs its 20-day average.">Volume</th>'
+    ? '<th title="Volume vs its own history: the 09:15 10-min bar for intraday/EOD, or the completed period volume for weekly/monthly.">Volume</th>'
     : "";
   const toggle =
     ordered.length > previewRows
@@ -569,6 +600,8 @@ function strategyCard(strategy) {
           <button class="subtab-chip${activeSubtab === "all" ? " active" : ""}" data-name="${name}" data-subtab="all">All</button>
           <button class="subtab-chip${activeSubtab === "intraday" ? " active" : ""}" data-name="${name}" data-subtab="intraday">Intraday (10m)</button>
           <button class="subtab-chip${activeSubtab === "eod" ? " active" : ""}" data-name="${name}" data-subtab="eod">Daily (EOD)</button>
+          <button class="subtab-chip${activeSubtab === "weekly" ? " active" : ""}" data-name="${name}" data-subtab="weekly">Weekly</button>
+          <button class="subtab-chip${activeSubtab === "monthly" ? " active" : ""}" data-name="${name}" data-subtab="monthly">Monthly</button>
         </div>`
       : "";
 

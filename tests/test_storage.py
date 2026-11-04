@@ -149,6 +149,26 @@ def test_long_and_short_on_same_candle_are_distinct(tmp_path) -> None:
     assert store.save_run("TestStrategy", [long_signal, short_signal]) == []
 
 
+def test_variants_on_same_candle_are_distinct(tmp_path) -> None:
+    """OEL weekly and monthly can share a period-end timestamp."""
+    store = SignalStore(_settings(tmp_path))
+    candle_time = datetime.now(IST)
+
+    weekly = _signal("SBIN")
+    weekly.timestamp = candle_time
+    weekly.metadata = {"variant": "weekly"}
+    monthly = _signal("SBIN")
+    monthly.timestamp = candle_time
+    monthly.metadata = {"variant": "monthly"}
+
+    assert len(store.save_run("TestStrategy", [weekly, monthly])) == 2
+    latest = store.get_latest("TestStrategy")
+    assert {row["variant"] for row in latest} == {"weekly", "monthly"}
+
+    # Re-saving both is a no-op; the unique key includes variant.
+    assert store.save_run("TestStrategy", [weekly, monthly]) == []
+
+
 def test_migration_backfills_direction_from_metadata(tmp_path) -> None:
     """An older database without a direction column is upgraded in place."""
     import json
@@ -180,7 +200,7 @@ def test_migration_backfills_direction_from_metadata(tmp_path) -> None:
             "SBIN",
             candle_time,
             100.0,
-            json.dumps({"direction": "LONG"}),
+            json.dumps({"direction": "LONG", "variant": "weekly"}),
         ),
     )
     conn.commit()
@@ -190,9 +210,10 @@ def test_migration_backfills_direction_from_metadata(tmp_path) -> None:
     rows = store.get_latest("TestStrategy")
     assert len(rows) == 1
     assert rows[0]["direction"] == "LONG"
+    assert rows[0]["variant"] == "weekly"
 
-    # The migrated row participates in the new direction-aware dedup key.
+    # The migrated row participates in the new direction/variant-aware dedup key.
     repeat = _signal("SBIN")
     repeat.timestamp = datetime.fromisoformat(candle_time)
-    repeat.metadata = {"direction": "LONG"}
+    repeat.metadata = {"direction": "LONG", "variant": "weekly"}
     assert store.save_run("TestStrategy", [repeat]) == []
